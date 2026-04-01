@@ -113,7 +113,7 @@ func TestAppRootPromptTextMode(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
-	if stdout.String() != "done" {
+	if stdout.String() != "done\n" {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
 }
@@ -993,7 +993,7 @@ func TestAppRunSkipsSlowGenerationMetadataNearTimeout(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
-	if stdout.String() != "done" {
+	if stdout.String() != "done\n" {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
 	if generationCalls != 0 {
@@ -1134,7 +1134,7 @@ func TestAppPersistsRedactedToolMessagesInSessions(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
-	if stdout.String() != "done" {
+	if stdout.String() != "done\n" {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
 

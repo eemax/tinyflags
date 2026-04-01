@@ -21,10 +21,18 @@ func NewTextRenderer(w io.Writer) *TextRenderer {
 
 func (r *TextRenderer) Render(result core.AgentResult) error {
 	if result.ResultJSON != nil {
-		_, err := r.w.Write(result.ResultJSON)
+		b := result.ResultJSON
+		if len(b) > 0 && b[len(b)-1] != '\n' {
+			b = append(b, '\n')
+		}
+		_, err := r.w.Write(b)
 		return err
 	}
-	_, err := io.WriteString(r.w, result.Result)
+	s := result.Result
+	if s != "" && s[len(s)-1] != '\n' {
+		s += "\n"
+	}
+	_, err := io.WriteString(r.w, s)
 	return err
 }
 
@@ -40,7 +48,11 @@ func NewJSONRenderer(w io.Writer, resultOnly bool) *JSONRenderer {
 func (r *JSONRenderer) Render(result core.AgentResult) error {
 	if r.resultOnly {
 		if result.ResultJSON != nil {
-			_, err := r.w.Write(result.ResultJSON)
+			b := result.ResultJSON
+			if len(b) > 0 && b[len(b)-1] != '\n' {
+				b = append(b, '\n')
+			}
+			_, err := r.w.Write(b)
 			return err
 		}
 		return json.NewEncoder(r.w).Encode(result.Result)

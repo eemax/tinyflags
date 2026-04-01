@@ -16,8 +16,8 @@ func TestTextRendererWritesPlainText(t *testing.T) {
 	if err := renderer.Render(core.AgentResult{Result: "hello"}); err != nil {
 		t.Fatalf("Render returned error: %v", err)
 	}
-	if got := buf.String(); got != "hello" {
-		t.Fatalf("output = %q, want %q", got, "hello")
+	if got := buf.String(); got != "hello\n" {
+		t.Fatalf("output = %q, want %q", got, "hello\n")
 	}
 }
 
@@ -40,7 +40,7 @@ func TestTextRendererPrefersStructuredJSON(t *testing.T) {
 	if err := renderer.Render(core.AgentResult{Result: "ignored", ResultJSON: json.RawMessage(`{"ok":true}`)}); err != nil {
 		t.Fatalf("Render returned error: %v", err)
 	}
-	if got := buf.String(); got != `{"ok":true}` {
+	if got := buf.String(); got != "{\"ok\":true}\n" {
 		t.Fatalf("output = %q", got)
 	}
 }

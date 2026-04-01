@@ -83,23 +83,26 @@ func (a *App) Execute(args []string) int {
 		if format == "" {
 			format = hintedFormat(err)
 		}
-		code := cerr.ExitRuntime
-		var exitErr *cerr.ExitCodeError
-		if errors.As(err, &exitErr) {
-			code = exitErr.Code
-			if format == "json" {
-				_ = output.WriteErrorJSON(a.Stdout, code, errorTypeForExitCode(code), exitErr.Error())
-			}
-			fmt.Fprintln(a.Stderr, exitErr.Error())
-			return code
-		}
+		code, message := cliErrorDetails(err)
 		if format == "json" {
-			_ = output.WriteErrorJSON(a.Stdout, code, errorTypeForExitCode(code), err.Error())
+			_ = output.WriteErrorJSON(a.Stdout, code, errorTypeForExitCode(code), message)
 		}
-		fmt.Fprintln(a.Stderr, err.Error())
+		fmt.Fprintln(a.Stderr, message)
 		return code
 	}
 	return cerr.ExitSuccess
+}
+
+func cliErrorDetails(err error) (int, string) {
+	if err == nil {
+		return cerr.ExitSuccess, ""
+	}
+	code := cerr.ExitRuntime
+	var exitErr *cerr.ExitCodeError
+	if errors.As(err, &exitErr) {
+		code = exitErr.Code
+	}
+	return code, err.Error()
 }
 
 func (a *App) NewRootCommand() *cobra.Command {
@@ -196,7 +199,11 @@ func (a *App) renderValue(format string, value any, text func() string) error {
 		enc.SetEscapeHTML(false)
 		return enc.Encode(value)
 	}
-	_, err := io.WriteString(a.Stdout, text())
+	s := text()
+	if s != "" && s[len(s)-1] != '\n' {
+		s += "\n"
+	}
+	_, err := io.WriteString(a.Stdout, s)
 	return err
 }
 

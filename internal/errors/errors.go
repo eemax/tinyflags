@@ -24,6 +24,9 @@ func (e *ExitCodeError) Error() string {
 	if e == nil {
 		return ""
 	}
+	if e.Message != "" && e.Wrapped != nil {
+		return fmt.Sprintf("%s: %v", e.Message, e.Wrapped)
+	}
 	if e.Message != "" {
 		return e.Message
 	}
