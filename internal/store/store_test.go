@@ -10,6 +10,7 @@ import (
 	"github.com/eemax/tinyflags/internal/core"
 	cerr "github.com/eemax/tinyflags/internal/errors"
 	"github.com/eemax/tinyflags/internal/store"
+	_ "modernc.org/sqlite"
 )
 
 func TestOpenDBBootstrapsSchema(t *testing.T) {
@@ -29,8 +30,8 @@ func TestOpenDBBootstrapsSchema(t *testing.T) {
 	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 {
-		t.Fatalf("user_version = %d, want 1", version)
+	if version != 2 {
+		t.Fatalf("user_version = %d, want 2", version)
 	}
 }
 
@@ -94,11 +95,19 @@ func TestHooksPersistRunToolAndShellRecords(t *testing.T) {
 
 	var status string
 	var exitCode int
-	if err := db.QueryRow(`SELECT status, exit_code FROM runs LIMIT 1`).Scan(&status, &exitCode); err != nil {
+	var responseModel sql.NullString
+	var responseID sql.NullString
+	var finishReason sql.NullString
+	var nativeFinishReason sql.NullString
+	var providerMetadataJSON sql.NullString
+	if err := db.QueryRow(`SELECT status, exit_code, response_model, provider_response_id, finish_reason, native_finish_reason, provider_metadata_json FROM runs LIMIT 1`).Scan(&status, &exitCode, &responseModel, &responseID, &finishReason, &nativeFinishReason, &providerMetadataJSON); err != nil {
 		t.Fatal(err)
 	}
 	if status != "success" || exitCode != 0 {
 		t.Fatalf("run status/exit = %q/%d", status, exitCode)
+	}
+	if responseModel.Valid || responseID.Valid || finishReason.Valid || nativeFinishReason.Valid || providerMetadataJSON.Valid {
+		t.Fatalf("unexpected provider metadata columns: model=%q id=%q finish=%q native=%q metadata=%q", responseModel.String, responseID.String, finishReason.String, nativeFinishReason.String, providerMetadataJSON.String)
 	}
 }
 
@@ -133,6 +142,108 @@ func TestHooksPersistErrorExitCode(t *testing.T) {
 	}
 	if status != "error" || exitCode != cerr.ExitShellFailure {
 		t.Fatalf("run status/exit = %q/%d", status, exitCode)
+	}
+}
+
+func TestHooksPersistProviderMetadataOnSuccess(t *testing.T) {
+	db, err := store.OpenDB(filepath.Join(t.TempDir(), "tinyflags.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tracker := store.NewRunTracker(store.HookConfig{
+		Logger: store.NewSQLiteRunLogger(db),
+		Run: core.RunRecord{
+			ModeName:  "text",
+			ModelName: "openai/gpt-4.1",
+			Format:    "json",
+		},
+	})
+	hooks := tracker.Hooks()
+
+	if err := hooks.OnLoopStart(context.Background(), core.RuntimeRequest{Prompt: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := hooks.OnStepComplete(context.Background(), 1, core.CompletionResponse{
+		Usage: core.Usage{InputTokens: 3, OutputTokens: 2},
+		ProviderMetadata: core.ProviderMetadata{
+			ResponseID:         "gen-123",
+			ResponseModel:      "openai/gpt-4.1",
+			FinishReason:       "stop",
+			NativeFinishReason: "stop",
+			Extra:              map[string]any{"router": "openrouter/auto"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tracker.FinalizeSuccess(core.AgentResult{
+		ExitCode: 0,
+		Usage:    core.Usage{InputTokens: 3, OutputTokens: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var responseModel, responseID, finishReason, nativeFinishReason, providerMetadataJSON string
+	if err := db.QueryRow(`SELECT response_model, provider_response_id, finish_reason, native_finish_reason, provider_metadata_json FROM runs LIMIT 1`).Scan(&responseModel, &responseID, &finishReason, &nativeFinishReason, &providerMetadataJSON); err != nil {
+		t.Fatal(err)
+	}
+	if responseModel != "openai/gpt-4.1" || responseID != "gen-123" || finishReason != "stop" || nativeFinishReason != "stop" {
+		t.Fatalf("provider metadata columns = %q %q %q %q", responseModel, responseID, finishReason, nativeFinishReason)
+	}
+	if providerMetadataJSON == "" {
+		t.Fatal("expected provider metadata json")
+	}
+}
+
+func TestHooksPersistProviderMetadataOnError(t *testing.T) {
+	db, err := store.OpenDB(filepath.Join(t.TempDir(), "tinyflags.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tracker := store.NewRunTracker(store.HookConfig{
+		Logger: store.NewSQLiteRunLogger(db),
+		Run: core.RunRecord{
+			ModeName:  "text",
+			ModelName: "openai/gpt-4.1",
+			Format:    "text",
+		},
+	})
+	hooks := tracker.Hooks()
+
+	if err := hooks.OnLoopStart(context.Background(), core.RuntimeRequest{Prompt: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	providerErr := &core.ProviderError{
+		Err: cerr.New(cerr.ExitRuntime, "provider rejected schema"),
+		Metadata: core.ProviderMetadata{
+			ResponseID:    "gen-failed",
+			ResponseModel: "openai/gpt-4.1",
+			Error: &core.ProviderErrorDetail{
+				HTTPStatus: 400,
+				Message:    "provider rejected schema",
+				Code:       400,
+			},
+		},
+	}
+	if err := hooks.OnError(context.Background(), providerErr); err != nil {
+		t.Fatal(err)
+	}
+	if err := tracker.FinalizeError(providerErr); err != nil {
+		t.Fatal(err)
+	}
+
+	var responseModel, responseID, providerMetadataJSON string
+	if err := db.QueryRow(`SELECT response_model, provider_response_id, provider_metadata_json FROM runs LIMIT 1`).Scan(&responseModel, &responseID, &providerMetadataJSON); err != nil {
+		t.Fatal(err)
+	}
+	if responseModel != "openai/gpt-4.1" || responseID != "gen-failed" {
+		t.Fatalf("provider metadata columns = %q %q", responseModel, responseID)
+	}
+	if providerMetadataJSON == "" {
+		t.Fatal("expected provider metadata json")
 	}
 }
 
@@ -174,6 +285,67 @@ func TestDebugRunsReturnsStoredRuns(t *testing.T) {
 	}
 	if len(runs) != 1 || runs[0].Prompt != "hello" {
 		t.Fatalf("runs = %+v", runs)
+	}
+}
+
+func TestOpenDBMigratesV1RunsTableInPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tinyflags.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE runs (
+		id INTEGER PRIMARY KEY,
+		session_id INTEGER,
+		mode_name TEXT NOT NULL,
+		model_name TEXT NOT NULL,
+		prompt TEXT NOT NULL,
+		stdin_text TEXT,
+		system_text TEXT,
+		skill_name TEXT,
+		cwd TEXT,
+		format TEXT NOT NULL,
+		plan_only INTEGER NOT NULL,
+		status TEXT NOT NULL,
+		exit_code INTEGER NOT NULL,
+		started_at TEXT NOT NULL,
+		finished_at TEXT,
+		duration_ms INTEGER,
+		input_tokens INTEGER,
+		output_tokens INTEGER
+	);`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 1;`); err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO runs (id, mode_name, model_name, prompt, format, plan_only, status, exit_code, started_at) VALUES (1, 'text', 'openai/gpt-4o-mini', 'hello', 'text', 0, 'running', 0, ?)`, startedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := store.OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+
+	var version int
+	if err := migrated.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 {
+		t.Fatalf("user_version = %d, want 2", version)
+	}
+	var prompt string
+	if err := migrated.QueryRow(`SELECT prompt FROM runs WHERE id = 1`).Scan(&prompt); err != nil {
+		t.Fatal(err)
+	}
+	if prompt != "hello" {
+		t.Fatalf("prompt = %q", prompt)
 	}
 }
 

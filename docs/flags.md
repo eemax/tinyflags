@@ -55,7 +55,7 @@ These flags apply to `tinyflags "prompt"` and `tinyflags run "prompt"`:
 | `--system` | string | empty | Inline system prompt layer |
 | `--skill` | string | empty | Load named skill content |
 | `--model` | string | empty | Override mode model or model alias |
-| `--output-schema` | string | empty | Path to JSON Schema for final output validation |
+| `--output-schema` | string | empty | Path to JSON Schema for native structured-output requests plus final output validation |
 | `--plan` | bool | `false` | Plan-only mode; tools return non-executing results |
 | `--timeout` | duration | resolved from mode/config, default `2m` | Hard cap for the full invocation, including post-loop validation and persistence |
 | `--max-steps` | int | resolved from mode/config | Provider/tool loop step cap |
@@ -101,6 +101,8 @@ Subcommands:
 - `path`
 - `validate`
 
+`config validate` resolves the configured modes, checks the default model alias, and validates OpenRouter model compatibility when the public model catalog is reachable. Catalog lookup failures are reported as warnings instead of hard failures.
+
 ### `tinyflags doctor`
 
 Runs checks for:
@@ -111,6 +113,7 @@ Runs checks for:
 - skills directory
 - shell path
 - OpenRouter connectivity
+- OpenRouter model catalog and resolved-model capability validation
 
 ### `tinyflags version`
 
@@ -202,7 +205,7 @@ keeps the unspecified `commander` fields intact.
 | Alias | Resolved Model |
 | --- | --- |
 | `fast` | `openai/gpt-4o-mini` |
-| `smart` | `anthropic/claude-opus-4-5` |
+| `smart` | `anthropic/claude-opus-4.5` |
 | `ops` | `openai/gpt-4.1` |
 
 ### Shipped Modes

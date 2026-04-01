@@ -85,3 +85,10 @@ system = "custom only"
 		t.Fatalf("Model = %q", mode.Model)
 	}
 }
+
+func TestDefaultConfigUsesCurrentSmartAlias(t *testing.T) {
+	cfg := config.DefaultConfig()
+	if cfg.Models["smart"] != "anthropic/claude-opus-4.5" {
+		t.Fatalf("smart = %q", cfg.Models["smart"])
+	}
+}

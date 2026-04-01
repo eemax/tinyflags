@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
 	"time"
 )
 
@@ -132,6 +133,25 @@ type Usage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
+type ProviderErrorDetail struct {
+	HTTPStatus int            `json:"http_status,omitempty"`
+	Code       int            `json:"code,omitempty"`
+	Type       string         `json:"type,omitempty"`
+	Message    string         `json:"message,omitempty"`
+	Metadata   map[string]any `json:"metadata,omitempty"`
+}
+
+type ProviderMetadata struct {
+	ResponseID         string               `json:"response_id,omitempty"`
+	ResponseModel      string               `json:"response_model,omitempty"`
+	FinishReason       string               `json:"finish_reason,omitempty"`
+	NativeFinishReason string               `json:"native_finish_reason,omitempty"`
+	SystemFingerprint  string               `json:"system_fingerprint,omitempty"`
+	Refusal            string               `json:"refusal,omitempty"`
+	Error              *ProviderErrorDetail `json:"error,omitempty"`
+	Extra              map[string]any       `json:"extra,omitempty"`
+}
+
 type CompletionRequest struct {
 	Model      string
 	Messages   []Message
@@ -146,6 +166,7 @@ type CompletionResponse struct {
 	AssistantMessage Message
 	ToolCalls        []ToolCallRequest
 	Usage            Usage
+	ProviderMetadata ProviderMetadata
 	Raw              []byte
 	Refusal          bool
 }
@@ -171,24 +192,29 @@ type StoredMessage struct {
 }
 
 type RunRecord struct {
-	ID           int64      `json:"id"`
-	SessionID    *int64     `json:"session_id,omitempty"`
-	ModeName     string     `json:"mode_name"`
-	ModelName    string     `json:"model_name"`
-	Prompt       string     `json:"prompt"`
-	StdinText    string     `json:"stdin_text,omitempty"`
-	SystemText   string     `json:"system_text,omitempty"`
-	SkillName    string     `json:"skill_name,omitempty"`
-	CWD          string     `json:"cwd,omitempty"`
-	Format       string     `json:"format"`
-	PlanOnly     bool       `json:"plan_only"`
-	Status       string     `json:"status"`
-	ExitCode     int        `json:"exit_code"`
-	StartedAt    time.Time  `json:"started_at"`
-	FinishedAt   *time.Time `json:"finished_at,omitempty"`
-	DurationMS   int64      `json:"duration_ms,omitempty"`
-	InputTokens  int        `json:"input_tokens,omitempty"`
-	OutputTokens int        `json:"output_tokens,omitempty"`
+	ID                   int64      `json:"id"`
+	SessionID            *int64     `json:"session_id,omitempty"`
+	ModeName             string     `json:"mode_name"`
+	ModelName            string     `json:"model_name"`
+	ResponseModel        string     `json:"response_model,omitempty"`
+	ProviderResponseID   string     `json:"provider_response_id,omitempty"`
+	FinishReason         string     `json:"finish_reason,omitempty"`
+	NativeFinishReason   string     `json:"native_finish_reason,omitempty"`
+	ProviderMetadataJSON string     `json:"provider_metadata_json,omitempty"`
+	Prompt               string     `json:"prompt"`
+	StdinText            string     `json:"stdin_text,omitempty"`
+	SystemText           string     `json:"system_text,omitempty"`
+	SkillName            string     `json:"skill_name,omitempty"`
+	CWD                  string     `json:"cwd,omitempty"`
+	Format               string     `json:"format"`
+	PlanOnly             bool       `json:"plan_only"`
+	Status               string     `json:"status"`
+	ExitCode             int        `json:"exit_code"`
+	StartedAt            time.Time  `json:"started_at"`
+	FinishedAt           *time.Time `json:"finished_at,omitempty"`
+	DurationMS           int64      `json:"duration_ms,omitempty"`
+	InputTokens          int        `json:"input_tokens,omitempty"`
+	OutputTokens         int        `json:"output_tokens,omitempty"`
 }
 
 type ToolCallRecord struct {
@@ -240,6 +266,33 @@ type AgentResult struct {
 	ExitCode     int              `json:"-"`
 	ErrorType    string           `json:"-"`
 	ErrorMessage string           `json:"-"`
+}
+
+type ProviderError struct {
+	Err      error
+	Metadata ProviderMetadata
+}
+
+func (e *ProviderError) Error() string {
+	if e == nil || e.Err == nil {
+		return ""
+	}
+	return e.Err.Error()
+}
+
+func (e *ProviderError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func ProviderMetadataFromError(err error) (ProviderMetadata, bool) {
+	var providerErr *ProviderError
+	if !errors.As(err, &providerErr) || providerErr == nil {
+		return ProviderMetadata{}, false
+	}
+	return providerErr.Metadata, true
 }
 
 type SessionExport struct {

@@ -186,6 +186,8 @@ Optional OpenRouter smoke test:
 TINYFLAGS_OPENROUTER_SMOKE=1 TINYFLAGS_API_KEY=sk-... go test ./internal/provider/openrouter -run TestOpenRouterSmoke
 ```
 
+The env-gated smoke suite exercises plain text, tool-calling, and strict-schema OpenRouter requests.
+
 ## Current Limitations
 
 - Only the OpenRouter provider is implemented

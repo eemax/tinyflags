@@ -23,6 +23,10 @@ func Load(path string) ([]byte, error) {
 }
 
 func Validate(ctx context.Context, schemaBytes []byte, text string) (json.RawMessage, error) {
+	return ValidateJSON(ctx, schemaBytes, []byte(text))
+}
+
+func ValidateJSON(ctx context.Context, schemaBytes []byte, payloadBytes []byte) (json.RawMessage, error) {
 	if len(schemaBytes) == 0 {
 		return nil, nil
 	}
@@ -49,8 +53,8 @@ func Validate(ctx context.Context, schemaBytes []byte, text string) (json.RawMes
 			return
 		}
 		var payload any
-		if err := json.Unmarshal([]byte(text), &payload); err != nil {
-			done <- result{err: cerr.Wrap(cerr.ExitSchemaValidation, "parse model output as JSON", err)}
+		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+			done <- result{err: cerr.Wrap(cerr.ExitSchemaValidation, "parse JSON payload", err)}
 			return
 		}
 		if err := s.Validate(payload); err != nil {

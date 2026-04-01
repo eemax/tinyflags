@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,7 +26,7 @@ type RunLogger interface {
 	LogShellCommand(cmd core.ShellCommandRecord) error
 }
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 func OpenDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -57,6 +58,31 @@ func migrate(db *sql.DB) error {
 		return nil
 	}
 
+	if version == 0 {
+		return createLatestSchema(db)
+	}
+	if version == 1 {
+		stmts := []string{
+			`ALTER TABLE runs ADD COLUMN response_model TEXT;`,
+			`ALTER TABLE runs ADD COLUMN provider_response_id TEXT;`,
+			`ALTER TABLE runs ADD COLUMN finish_reason TEXT;`,
+			`ALTER TABLE runs ADD COLUMN native_finish_reason TEXT;`,
+			`ALTER TABLE runs ADD COLUMN provider_metadata_json TEXT;`,
+		}
+		for _, stmt := range stmts {
+			if _, err := db.Exec(stmt); err != nil {
+				return cerr.Wrap(cerr.ExitSessionFailure, "migrate database", err)
+			}
+		}
+		if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d;`, schemaVersion)); err != nil {
+			return cerr.Wrap(cerr.ExitSessionFailure, "set database schema version", err)
+		}
+		return nil
+	}
+	return nil
+}
+
+func createLatestSchema(db *sql.DB) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS sessions (
 			id INTEGER PRIMARY KEY,
@@ -69,6 +95,11 @@ func migrate(db *sql.DB) error {
 			session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
 			mode_name TEXT NOT NULL,
 			model_name TEXT NOT NULL,
+			response_model TEXT,
+			provider_response_id TEXT,
+			finish_reason TEXT,
+			native_finish_reason TEXT,
+			provider_metadata_json TEXT,
 			prompt TEXT NOT NULL,
 			stdin_text TEXT,
 			system_text TEXT,
@@ -146,9 +177,9 @@ func (l *SQLiteRunLogger) StartRun(run core.RunRecord) (int64, error) {
 		sessionID = *run.SessionID
 	}
 	result, err := l.db.Exec(
-		`INSERT INTO runs (session_id, mode_name, model_name, prompt, stdin_text, system_text, skill_name, cwd, format, plan_only, status, exit_code, started_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, run.ModeName, run.ModelName, run.Prompt, run.StdinText, run.SystemText, run.SkillName, run.CWD, run.Format, boolToInt(run.PlanOnly), run.Status, run.ExitCode, run.StartedAt.UTC().Format(time.RFC3339Nano),
+		`INSERT INTO runs (session_id, mode_name, model_name, response_model, provider_response_id, finish_reason, native_finish_reason, provider_metadata_json, prompt, stdin_text, system_text, skill_name, cwd, format, plan_only, status, exit_code, started_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sessionID, run.ModeName, run.ModelName, nullableString(run.ResponseModel), nullableString(run.ProviderResponseID), nullableString(run.FinishReason), nullableString(run.NativeFinishReason), nullableString(run.ProviderMetadataJSON), run.Prompt, run.StdinText, run.SystemText, run.SkillName, run.CWD, run.Format, boolToInt(run.PlanOnly), run.Status, run.ExitCode, run.StartedAt.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return 0, cerr.Wrap(cerr.ExitSessionFailure, "start run", err)
@@ -162,8 +193,8 @@ func (l *SQLiteRunLogger) FinishRun(id int64, result core.RunRecord) error {
 		finishedAt = result.FinishedAt.UTC().Format(time.RFC3339Nano)
 	}
 	_, err := l.db.Exec(
-		`UPDATE runs SET status=?, exit_code=?, finished_at=?, duration_ms=?, input_tokens=?, output_tokens=? WHERE id=?`,
-		result.Status, result.ExitCode, finishedAt, result.DurationMS, result.InputTokens, result.OutputTokens, id,
+		`UPDATE runs SET response_model=?, provider_response_id=?, finish_reason=?, native_finish_reason=?, provider_metadata_json=?, status=?, exit_code=?, finished_at=?, duration_ms=?, input_tokens=?, output_tokens=? WHERE id=?`,
+		nullableString(result.ResponseModel), nullableString(result.ProviderResponseID), nullableString(result.FinishReason), nullableString(result.NativeFinishReason), nullableString(result.ProviderMetadataJSON), result.Status, result.ExitCode, finishedAt, result.DurationMS, result.InputTokens, result.OutputTokens, id,
 	)
 	if err != nil {
 		return cerr.Wrap(cerr.ExitSessionFailure, "finish run", err)
@@ -217,12 +248,14 @@ type HookConfig struct {
 }
 
 type hookState struct {
-	mu            sync.Mutex
-	runID         int64
-	startedAt     time.Time
-	toolCallIDs   map[string]int64
-	toolCallTimes map[string]time.Time
-	usage         core.Usage
+	mu             sync.Mutex
+	runID          int64
+	startedAt      time.Time
+	toolCallIDs    map[string]int64
+	toolCallTimes  map[string]time.Time
+	usage          core.Usage
+	providerSteps  []core.ProviderMetadata
+	latestProvider core.ProviderMetadata
 }
 
 type RunTracker struct {
@@ -273,6 +306,7 @@ func (t *RunTracker) Hooks() agent.AgentHooks {
 			t.state.mu.Lock()
 			t.state.usage.InputTokens += resp.Usage.InputTokens
 			t.state.usage.OutputTokens += resp.Usage.OutputTokens
+			recordProviderMetadataLocked(t.state, resp.ProviderMetadata)
 			t.state.mu.Unlock()
 			return nil
 		},
@@ -345,6 +379,17 @@ func (t *RunTracker) Hooks() agent.AgentHooks {
 			}
 			return nil
 		},
+		OnError: func(ctx context.Context, err error) error {
+			_ = ctx
+			metadata, ok := core.ProviderMetadataFromError(err)
+			if !ok {
+				return nil
+			}
+			t.state.mu.Lock()
+			recordProviderMetadataLocked(t.state, metadata)
+			t.state.mu.Unlock()
+			return nil
+		},
 	}
 }
 
@@ -360,7 +405,8 @@ func (t *RunTracker) FinalizeSuccess(result core.AgentResult) error {
 
 func (t *RunTracker) FinalizeError(err error) error {
 	exitCode := cerr.ExitRuntime
-	if typed, ok := err.(*cerr.ExitCodeError); ok {
+	var typed *cerr.ExitCodeError
+	if errors.As(err, &typed) {
 		exitCode = typed.Code
 	}
 	return t.finish("error", exitCode, core.Usage{})
@@ -373,18 +419,26 @@ func (t *RunTracker) finish(status string, exitCode int, usage core.Usage) error
 	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
 		usage = t.state.usage
 	}
+	latestProvider := t.state.latestProvider
+	providerSteps := append([]core.ProviderMetadata(nil), t.state.providerSteps...)
 	t.state.mu.Unlock()
 	if runID == 0 {
 		return nil
 	}
 	now := t.cfg.Now().UTC()
+	metadataJSON := marshalProviderMetadata(providerSteps)
 	return t.cfg.Logger.FinishRun(runID, core.RunRecord{
-		Status:       status,
-		ExitCode:     exitCode,
-		FinishedAt:   &now,
-		DurationMS:   now.Sub(startedAt).Milliseconds(),
-		InputTokens:  usage.InputTokens,
-		OutputTokens: usage.OutputTokens,
+		ResponseModel:        latestProvider.ResponseModel,
+		ProviderResponseID:   latestProvider.ResponseID,
+		FinishReason:         latestProvider.FinishReason,
+		NativeFinishReason:   latestProvider.NativeFinishReason,
+		ProviderMetadataJSON: metadataJSON,
+		Status:               status,
+		ExitCode:             exitCode,
+		FinishedAt:           &now,
+		DurationMS:           now.Sub(startedAt).Milliseconds(),
+		InputTokens:          usage.InputTokens,
+		OutputTokens:         usage.OutputTokens,
 	})
 }
 
@@ -413,9 +467,46 @@ func capturedString(enabled bool, value string) string {
 	return value
 }
 
+func nullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func recordProviderMetadataLocked(state *hookState, metadata core.ProviderMetadata) {
+	if providerMetadataEmpty(metadata) {
+		return
+	}
+	state.latestProvider = metadata
+	state.providerSteps = append(state.providerSteps, metadata)
+}
+
+func providerMetadataEmpty(metadata core.ProviderMetadata) bool {
+	return metadata.ResponseID == "" &&
+		metadata.ResponseModel == "" &&
+		metadata.FinishReason == "" &&
+		metadata.NativeFinishReason == "" &&
+		metadata.SystemFingerprint == "" &&
+		metadata.Refusal == "" &&
+		metadata.Error == nil &&
+		len(metadata.Extra) == 0
+}
+
+func marshalProviderMetadata(steps []core.ProviderMetadata) string {
+	if len(steps) == 0 {
+		return ""
+	}
+	payload, err := json.Marshal(map[string]any{"steps": steps})
+	if err != nil {
+		return ""
+	}
+	return string(payload)
+}
+
 func DebugRuns(ctx context.Context, db *sql.DB) ([]core.RunRecord, error) {
 	_ = ctx
-	rows, err := db.Query(`SELECT id, mode_name, model_name, prompt, format, status, exit_code, started_at FROM runs ORDER BY id`)
+	rows, err := db.Query(`SELECT id, mode_name, model_name, response_model, provider_response_id, finish_reason, native_finish_reason, provider_metadata_json, prompt, format, status, exit_code, started_at FROM runs ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -424,9 +515,19 @@ func DebugRuns(ctx context.Context, db *sql.DB) ([]core.RunRecord, error) {
 	for rows.Next() {
 		var rec core.RunRecord
 		var started string
-		if err := rows.Scan(&rec.ID, &rec.ModeName, &rec.ModelName, &rec.Prompt, &rec.Format, &rec.Status, &rec.ExitCode, &started); err != nil {
+		var responseModel sql.NullString
+		var providerResponseID sql.NullString
+		var finishReason sql.NullString
+		var nativeFinishReason sql.NullString
+		var providerMetadataJSON sql.NullString
+		if err := rows.Scan(&rec.ID, &rec.ModeName, &rec.ModelName, &responseModel, &providerResponseID, &finishReason, &nativeFinishReason, &providerMetadataJSON, &rec.Prompt, &rec.Format, &rec.Status, &rec.ExitCode, &started); err != nil {
 			return nil, err
 		}
+		rec.ResponseModel = responseModel.String
+		rec.ProviderResponseID = providerResponseID.String
+		rec.FinishReason = finishReason.String
+		rec.NativeFinishReason = nativeFinishReason.String
+		rec.ProviderMetadataJSON = providerMetadataJSON.String
 		rec.StartedAt, _ = time.Parse(time.RFC3339Nano, started)
 		out = append(out, rec)
 	}

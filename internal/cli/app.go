@@ -206,7 +206,7 @@ func (a *App) bindRunFlags(flags *pflag.FlagSet, opts *runOptions) {
 	flags.StringVar(&opts.system, "system", "", "Inject inline system prompt")
 	flags.StringVar(&opts.skill, "skill", "", "Load named reusable instruction text")
 	flags.StringVar(&opts.model, "model", "", "Override mode/model default")
-	flags.StringVar(&opts.outputSchema, "output-schema", "", "Path to JSON schema file for structured output validation")
+	flags.StringVar(&opts.outputSchema, "output-schema", "", "Path to JSON schema file for native structured output requests and final validation")
 	flags.BoolVar(&opts.plan, "plan", false, "Disable side-effecting tool execution; request a plan instead")
 	flags.DurationVar(&opts.timeout, "timeout", 0, "Hard cap for the invocation")
 	flags.IntVar(&opts.maxSteps, "max-steps", -1, "Cap model/tool loop iterations")
@@ -370,6 +370,11 @@ func (a *App) executeRun(ctx context.Context, cmd *cobra.Command, args []string,
 			}
 		}
 		return withFormat(err, formatHint)
+	}
+	if runtimeOpenRouter, ok := runtimeProvider.(*openrouter.Client); ok {
+		if err := validateRunModel(runCtx, runtimeOpenRouter, resolvedMode, len(schemaBytes) > 0); err != nil {
+			return finishError(err)
+		}
 	}
 	planInstruction := cfg.PlanModeInstruction
 	if strings.TrimSpace(planInstruction) == "" {
@@ -706,8 +711,32 @@ func (a *App) newConfigCommand(globals *globalOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
+			defer cancel()
+			report, err := validateConfigModels(ctx, cfg, a.HTTPClient)
+			if err != nil {
+				return err
+			}
+			if report.HasFailures() {
+				return cerr.New(cerr.ExitRuntime, strings.Join(report.FailureMessages(), "; "))
+			}
 			payload := map[string]any{"ok": true, "path": path, "default_mode": cfg.DefaultMode}
-			return a.renderValue(globals.format, payload, func() string { return "ok" })
+			if len(report.Checks) > 0 {
+				payload["openrouter_validation"] = report.Checks
+			}
+			if len(report.Warnings) > 0 {
+				payload["warnings"] = report.Warnings
+			}
+			return a.renderValue(globals.format, payload, func() string {
+				if len(report.Warnings) == 0 {
+					return "ok"
+				}
+				lines := []string{"ok"}
+				for _, warning := range report.Warnings {
+					lines = append(lines, "warning: "+warning)
+				}
+				return strings.Join(lines, "\n")
+			})
 		},
 	})
 	return cmd
@@ -757,6 +786,21 @@ func (a *App) newDoctorCommand(globals *globalOptions) *cobra.Command {
 					checks["openrouter"] = map[string]any{"ok": true}
 				}
 			}
+			validateCtx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
+			defer cancel()
+			report, err := validateConfigModels(validateCtx, cfg, a.HTTPClient)
+			if err != nil {
+				checks["openrouter_model_validation"] = map[string]any{"ok": false, "error": err.Error()}
+			} else {
+				item := map[string]any{"ok": !report.HasFailures()}
+				if len(report.Checks) > 0 {
+					item["checks"] = report.Checks
+				}
+				if len(report.Warnings) > 0 {
+					item["warnings"] = report.Warnings
+				}
+				checks["openrouter_model_validation"] = item
+			}
 			return a.renderValue(globals.format, checks, func() string {
 				lines := []string{}
 				keys := make([]string, 0, len(checks))
@@ -778,6 +822,18 @@ func (a *App) newDoctorCommand(globals *globalOptions) *cobra.Command {
 					line := fmt.Sprintf("%s: %s", name, status)
 					if err, ok := item["error"].(string); ok && err != "" {
 						line += " (" + err + ")"
+					} else if warnings, ok := item["warnings"].([]string); ok && len(warnings) > 0 {
+						line += " (warning: " + strings.Join(warnings, "; ") + ")"
+					} else if warnings, ok := item["warnings"].([]any); ok && len(warnings) > 0 {
+						values := make([]string, 0, len(warnings))
+						for _, warning := range warnings {
+							if text, ok := warning.(string); ok && text != "" {
+								values = append(values, text)
+							}
+						}
+						if len(values) > 0 {
+							line += " (warning: " + strings.Join(values, "; ") + ")"
+						}
 					}
 					lines = append(lines, line)
 				}

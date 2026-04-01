@@ -55,7 +55,7 @@ func DefaultConfig() core.Config {
 		LogLevel:       "error",
 		Models: map[string]string{
 			"fast":  "openai/gpt-4o-mini",
-			"smart": "anthropic/claude-opus-4-5",
+			"smart": "anthropic/claude-opus-4.5",
 			"ops":   "openai/gpt-4.1",
 		},
 		Modes: map[string]core.ModeConfig{

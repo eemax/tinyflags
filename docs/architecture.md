@@ -21,12 +21,13 @@ High-level flow for `tinyflags [flags] "prompt"`:
 3. `internal/mode` converts config plus runtime overrides into an immutable `ResolvedMode`.
 4. `internal/skill` resolves optional skill content from project-local, global, or inline config sources.
 5. `internal/schema` loads JSON schema bytes when `--output-schema` is set.
-6. `internal/session` loads or creates the session, or forks it when requested.
-7. `internal/agent` assembles the prompt stack and drives the provider/tool loop.
-8. `internal/hooks` composes stderr logging hooks and optional SQLite run-log hooks for run/tool telemetry.
-9. `internal/cli` validates schema output, persists session messages when enabled, and finalizes the run record with the true terminal status.
-10. `internal/output` renders the final text or JSON result to stdout.
-11. `internal/cli` maps failures to stable exit codes and writes user-facing errors to stderr.
+6. `internal/cli` performs OpenRouter model-capability preflight for the resolved request when the active provider is the built-in OpenRouter client.
+7. `internal/session` loads or creates the session, or forks it when requested.
+8. `internal/agent` assembles the prompt stack and drives the provider/tool loop.
+9. `internal/hooks` composes stderr logging hooks and optional SQLite run-log hooks for run/tool telemetry.
+10. `internal/cli` validates schema output, persists session messages when enabled, and finalizes the run record with the true terminal status.
+11. `internal/output` renders the final text or JSON result to stdout.
+12. `internal/cli` maps failures to stable exit codes and writes user-facing errors to stderr.
 
 ## Prompt Assembly
 
@@ -36,12 +37,12 @@ The agent loop builds messages in this order:
 2. skill prompt
 3. inline `--system`
 4. plan instruction, when `--plan` is set
-5. JSON-schema instruction, when `--output-schema` is set
+5. short JSON-only instruction, when `--output-schema` is set
 6. prior session history
 7. prompt argument
 8. stdin content as a separate user message
 
-The current implementation injects the schema instruction as an additional system message after the plan message so the provider is told to return JSON-only output before the first round trip.
+When schema mode is active, the prompt stack only carries a short JSON-only instruction. The full schema is sent to OpenRouter through native structured outputs instead of being duplicated into the system prompt.
 
 ## Package Layout
 
@@ -90,14 +91,17 @@ Core packages:
 
 - `messages` map from internal `core.Message`
 - `tools` map to function tools
-- `response_format = {"type":"json_object"}` is set when schema output is requested
+- `response_format = {"type":"json_schema", "json_schema": {"name": "tinyflags_output", "strict": true, "schema": ...}}` is set when schema output is requested
+- `provider.require_parameters = true` is set whenever tools or schema output are required
+- the public `/models` catalog is used by `config validate`, `doctor`, and run preflight to confirm model existence plus `tools` / `structured_outputs` support
 
 The response is normalized back into:
 
 - assistant text
 - tool-call requests
 - token usage
-- refusal detection when the finish reason indicates content filtering
+- refusal detection from finish-reason and refusal fields
+- provider metadata including actual response model, response id, finish reasons, and structured error data
 
 ## Tool System
 
@@ -105,6 +109,7 @@ Tools are admitted only when:
 
 - the tool is registered in the binary
 - the tool is allowed by the selected mode
+- the tool-call arguments satisfy the tool's declared JSON Schema before execution
 
 Current shipped tools:
 
@@ -142,6 +147,7 @@ Important persistence behaviors:
 - run, tool-call, and shell-command logging are attached via hooks
 - run logging hooks are installed only when `ResolvedMode.StoreRunLog` is true
 - final run status is written after schema validation and session persistence so the `runs` table reflects the real CLI outcome
+- run rows persist both the requested model (`model_name`) and actual provider result metadata such as `response_model`, response id, finish reasons, and per-step provider metadata JSON
 - shell-command rows honor `capture_commands`, `capture_stdout`, and `capture_stderr`
 - hook persistence failures are treated as run failures instead of being silently ignored
 - database schema state is versioned through SQLite `PRAGMA user_version`

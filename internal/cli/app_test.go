@@ -5,13 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/eemax/tinyflags/internal/cli"
 	"github.com/eemax/tinyflags/internal/core"
 	"github.com/eemax/tinyflags/internal/provider"
+	"github.com/eemax/tinyflags/internal/provider/openrouter"
 	"github.com/eemax/tinyflags/internal/session"
 	"github.com/eemax/tinyflags/internal/store"
 )
@@ -300,7 +304,9 @@ func TestAppSessionClearCommand(t *testing.T) {
 }
 
 func TestAppDoctorJSON(t *testing.T) {
-	app, stdout, _, cfgPath := newTestApp(t, &scriptedProvider{})
+	server := newModelCatalogServer(t, http.StatusOK, defaultCatalogModels(), nil)
+	app, stdout, _, cfgPath := newTestAppWithExtraConfig(t, &scriptedProvider{}, "base_url = \""+server.URL+"\"\n")
+	app.HTTPClient = server.Client()
 	code := app.Execute([]string{"--config", cfgPath, "--format", "json", "doctor"})
 	if code != 0 {
 		t.Fatalf("exit code = %d", code)
@@ -311,6 +317,9 @@ func TestAppDoctorJSON(t *testing.T) {
 	}
 	if _, ok := payload["db"]; !ok {
 		t.Fatalf("doctor payload missing db check: %v", payload)
+	}
+	if _, ok := payload["openrouter_model_validation"]; !ok {
+		t.Fatalf("doctor payload missing openrouter_model_validation: %v", payload)
 	}
 }
 
@@ -356,7 +365,9 @@ func TestAppRenderFailureMarksRunAsError(t *testing.T) {
 }
 
 func TestAppConfigValidateJSON(t *testing.T) {
-	app, stdout, _, cfgPath := newTestApp(t, &scriptedProvider{})
+	server := newModelCatalogServer(t, http.StatusOK, defaultCatalogModels(), nil)
+	app, stdout, _, cfgPath := newTestAppWithExtraConfig(t, &scriptedProvider{}, "base_url = \""+server.URL+"\"\n")
+	app.HTTPClient = server.Client()
 	code := app.Execute([]string{"--config", cfgPath, "--format", "json", "config", "validate"})
 	if code != 0 {
 		t.Fatalf("exit code = %d", code)
@@ -367,6 +378,297 @@ func TestAppConfigValidateJSON(t *testing.T) {
 	}
 	if ok, _ := payload["ok"].(bool); !ok {
 		t.Fatalf("payload = %+v", payload)
+	}
+	if _, ok := payload["openrouter_validation"]; !ok {
+		t.Fatalf("expected openrouter_validation payload: %+v", payload)
+	}
+}
+
+func TestAppConfigValidateWarnsWhenCatalogUnavailable(t *testing.T) {
+	server := newModelCatalogServer(t, http.StatusInternalServerError, nil, nil)
+	app, stdout, _, cfgPath := newTestAppWithExtraConfig(t, &scriptedProvider{}, "base_url = \""+server.URL+"\"\n")
+	app.HTTPClient = server.Client()
+
+	code := app.Execute([]string{"--config", cfgPath, "--format", "json", "config", "validate"})
+	if code != 0 {
+		t.Fatalf("exit code = %d stdout=%q", code, stdout.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	warnings, ok := payload["warnings"].([]any)
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("expected warnings payload: %+v", payload)
+	}
+}
+
+func TestAppConfigValidateFailsOnUnsupportedModel(t *testing.T) {
+	server := newModelCatalogServer(t, http.StatusOK, []map[string]any{
+		{"id": "openai/gpt-4o-mini", "name": "GPT-4o mini", "supported_parameters": []string{"response_format"}},
+		{"id": "openai/gpt-4.1", "name": "GPT-4.1", "supported_parameters": []string{"tools"}},
+	}, nil)
+	app, stdout, stderr, cfgPath := newTestAppWithExtraConfig(t, &scriptedProvider{}, "base_url = \""+server.URL+"\"\n")
+	app.HTTPClient = server.Client()
+
+	code := app.Execute([]string{"--config", cfgPath, "--format", "json", "config", "validate"})
+	if code != 1 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if ok, _ := payload["ok"].(bool); ok {
+		t.Fatalf("expected error payload: %+v", payload)
+	}
+}
+
+func TestAppRunFailsPreflightWhenModelLacksTools(t *testing.T) {
+	var chatCalls int
+	server := newModelCatalogServer(t, http.StatusOK, []map[string]any{
+		{"id": "openai/gpt-4o-mini", "name": "GPT-4o mini", "supported_parameters": []string{"response_format", "structured_outputs"}},
+		{"id": "openai/gpt-4.1", "name": "GPT-4.1", "supported_parameters": []string{"tools"}},
+		{"id": "anthropic/claude-opus-4.5", "name": "Claude Opus 4.5", "supported_parameters": []string{"response_format", "structured_outputs"}},
+	}, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat/completions" {
+			chatCalls++
+		}
+	})
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := cli.NewApp(stdout, stderr)
+	registry := provider.NewRegistry()
+	registry.Register("openrouter", openrouter.New(server.URL, "secret", server.Client()))
+	app.ProviderRegistry = registry
+	app.HTTPClient = server.Client()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "tinyflags.db")
+	skillsDir := filepath.Join(dir, "skills")
+	if err := os.MkdirAll(skillsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configText := "version = 1\n" +
+		"api_key = \"secret\"\n" +
+		"base_url = \"" + server.URL + "\"\n" +
+		"db_path = \"" + dbPath + "\"\n" +
+		"skills_dir = \"" + skillsDir + "\"\n" +
+		"[modes.tool]\nmodel = \"fast\"\n"
+	if err := os.WriteFile(cfgPath, []byte(configText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code := app.Execute([]string{"--config", cfgPath, "--mode", "tool", "hello"})
+	if code != 1 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if chatCalls != 0 {
+		t.Fatalf("chat completions should not have been called, got %d", chatCalls)
+	}
+}
+
+func TestAppRunPreflightUsesInjectedOpenRouterClientCatalog(t *testing.T) {
+	var configModelCalls int
+	configServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		configModelCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{
+				{"id": "anthropic/claude-opus-4.5", "name": "Claude Opus 4.5", "supported_parameters": []string{"tools"}},
+			},
+		})
+	}))
+	defer configServer.Close()
+
+	var providerModelCalls int
+	var chatCalls int
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			providerModelCalls++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]any{
+					{"id": "anthropic/claude-opus-4.5", "name": "Claude Opus 4.5", "supported_parameters": []string{"structured_outputs"}},
+				},
+			})
+		case "/chat/completions":
+			chatCalls++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":    "gen-123",
+				"model": "anthropic/claude-opus-4.5",
+				"choices": []map[string]any{{
+					"message":       map[string]any{"content": "done"},
+					"finish_reason": "stop",
+				}},
+				"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer providerServer.Close()
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := cli.NewApp(stdout, stderr)
+	registry := provider.NewRegistry()
+	registry.Register("openrouter", openrouter.New(providerServer.URL, "secret", providerServer.Client()))
+	app.ProviderRegistry = registry
+	app.HTTPClient = configServer.Client()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "tinyflags.db")
+	skillsDir := filepath.Join(dir, "skills")
+	if err := os.MkdirAll(skillsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configText := "version = 1\n" +
+		"api_key = \"secret\"\n" +
+		"base_url = \"" + configServer.URL + "\"\n" +
+		"db_path = \"" + dbPath + "\"\n" +
+		"skills_dir = \"" + skillsDir + "\"\n"
+	if err := os.WriteFile(cfgPath, []byte(configText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code := app.Execute([]string{"--config", cfgPath, "--mode", "tool", "hello"})
+	if code != 1 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if providerModelCalls == 0 {
+		t.Fatal("expected injected provider catalog to be queried")
+	}
+	if configModelCalls != 0 {
+		t.Fatalf("expected config base_url catalog to be ignored, got %d calls", configModelCalls)
+	}
+	if chatCalls != 0 {
+		t.Fatalf("chat completions should not have been called, got %d", chatCalls)
+	}
+	if !bytes.Contains(stderr.Bytes(), []byte("does not support required features: tools")) {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestAppRunFailsPreflightWhenSchemaModelLacksResponseFormat(t *testing.T) {
+	var chatCalls int
+	server := newModelCatalogServer(t, http.StatusOK, []map[string]any{
+		{"id": "openai/gpt-4o-mini", "name": "GPT-4o mini", "supported_parameters": []string{"structured_outputs"}},
+		{"id": "openai/gpt-4.1", "name": "GPT-4.1", "supported_parameters": []string{"tools"}},
+		{"id": "anthropic/claude-opus-4.5", "name": "Claude Opus 4.5", "supported_parameters": []string{"tools"}},
+	}, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat/completions" {
+			chatCalls++
+		}
+		http.NotFound(w, r)
+	})
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := cli.NewApp(stdout, stderr)
+	registry := provider.NewRegistry()
+	registry.Register("openrouter", openrouter.New(server.URL, "secret", server.Client()))
+	app.ProviderRegistry = registry
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "tinyflags.db")
+	skillsDir := filepath.Join(dir, "skills")
+	schemaPath := filepath.Join(dir, "schema.json")
+	if err := os.MkdirAll(skillsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(schemaPath, []byte(`{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	configText := "version = 1\n" +
+		"api_key = \"secret\"\n" +
+		"base_url = \"" + server.URL + "\"\n" +
+		"db_path = \"" + dbPath + "\"\n" +
+		"skills_dir = \"" + skillsDir + "\"\n"
+	if err := os.WriteFile(cfgPath, []byte(configText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code := app.Execute([]string{"--config", cfgPath, "--mode", "text", "--output-schema", schemaPath, "hello"})
+	if code != 1 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if chatCalls != 0 {
+		t.Fatalf("chat completions should not have been called, got %d", chatCalls)
+	}
+	if !bytes.Contains(stderr.Bytes(), []byte("response_format")) {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestAppRunSkipsSlowGenerationMetadataNearTimeout(t *testing.T) {
+	var generationCalls int
+	server := newModelCatalogServer(t, http.StatusOK, defaultCatalogModels(), func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/chat/completions":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":    "gen-123",
+				"model": "openai/gpt-4o-mini",
+				"choices": []map[string]any{{
+					"message":       map[string]any{"content": "done"},
+					"finish_reason": "stop",
+				}},
+				"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
+			})
+		case "/generation":
+			generationCalls++
+			time.Sleep(200 * time.Millisecond)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"id":            "gen-123",
+					"model":         "openai/gpt-4o-mini",
+					"finish_reason": "stop",
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app := cli.NewApp(stdout, stderr)
+	registry := provider.NewRegistry()
+	registry.Register("openrouter", openrouter.New(server.URL, "secret", server.Client()))
+	app.ProviderRegistry = registry
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "tinyflags.db")
+	skillsDir := filepath.Join(dir, "skills")
+	if err := os.MkdirAll(skillsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configText := "version = 1\n" +
+		"api_key = \"secret\"\n" +
+		"base_url = \"" + server.URL + "\"\n" +
+		"db_path = \"" + dbPath + "\"\n" +
+		"skills_dir = \"" + skillsDir + "\"\n"
+	if err := os.WriteFile(cfgPath, []byte(configText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code := app.Execute([]string{"--config", cfgPath, "--mode", "text", "--timeout", "50ms", "hello"})
+	if code != 0 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if stdout.String() != "done" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if generationCalls != 0 {
+		t.Fatalf("expected slow generation metadata to be skipped, got %d calls", generationCalls)
 	}
 }
 
@@ -509,4 +811,33 @@ func dbPathFromConfig(t *testing.T, cfgPath string) string {
 	}
 	t.Fatal("db_path not found in config")
 	return ""
+}
+
+func newModelCatalogServer(t *testing.T, modelStatus int, models []map[string]any, extra func(http.ResponseWriter, *http.Request)) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if extra != nil && r.URL.Path != "/models" {
+			extra(w, r)
+			return
+		}
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(modelStatus)
+		if models == nil {
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": models})
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func defaultCatalogModels() []map[string]any {
+	return []map[string]any{
+		{"id": "openai/gpt-4o-mini", "name": "GPT-4o mini", "supported_parameters": []string{"response_format", "structured_outputs"}},
+		{"id": "openai/gpt-4.1", "name": "GPT-4.1", "supported_parameters": []string{"tools", "structured_outputs"}},
+		{"id": "anthropic/claude-opus-4.5", "name": "Claude Opus 4.5", "supported_parameters": []string{"tools", "structured_outputs"}},
+	}
 }

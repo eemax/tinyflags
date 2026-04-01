@@ -3,6 +3,7 @@ package agent_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/eemax/tinyflags/internal/agent"
@@ -29,16 +30,22 @@ func (p *fakeProvider) Complete(ctx context.Context, req core.CompletionRequest)
 }
 
 type fakeTool struct {
-	result core.ToolResult
-	err    error
+	spec      core.ToolSpec
+	result    core.ToolResult
+	err       error
+	execCount int
 }
 
 func (t *fakeTool) Name() string { return t.result.ToolName }
 func (t *fakeTool) Spec() core.ToolSpec {
+	if t.spec.Name != "" {
+		return t.spec
+	}
 	return core.ToolSpec{Name: t.result.ToolName}
 }
 func (t *fakeTool) Execute(ctx context.Context, call core.ToolCallRequest, execCtx tools.ExecContext) (core.ToolResult, error) {
 	_, _, _ = ctx, call, execCtx
+	t.execCount++
 	return t.result, t.err
 }
 
@@ -206,6 +213,112 @@ func TestRunnerFeedsToolErrorsBackWhenBudgetAllows(t *testing.T) {
 	}
 	if output.Result.Result != "wrapped up" {
 		t.Fatalf("result = %q", output.Result.Result)
+	}
+}
+
+func TestRunnerRejectsInvalidToolArgumentsBeforeExecution(t *testing.T) {
+	provider := &fakeProvider{
+		responses: []core.CompletionResponse{
+			{
+				AssistantMessage: core.Message{Role: "assistant"},
+				ToolCalls: []core.ToolCallRequest{{
+					ID:        "1",
+					Name:      "write_file",
+					Arguments: json.RawMessage(`{"path":7}`),
+				}},
+			},
+			{AssistantMessage: core.Message{Role: "assistant", Content: "wrapped up"}},
+		},
+	}
+	registry := tools.NewRegistry()
+	tool := &fakeTool{
+		spec: core.ToolSpec{
+			Name:        "write_file",
+			InputSchema: json.RawMessage(`{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}`),
+		},
+		result: core.ToolResult{ToolName: "write_file", Status: "ok", Content: "should not run"},
+	}
+	if err := registry.Register(tool); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &agent.Runner{Provider: provider, Tools: registry}
+	output, err := runner.Run(context.Background(), agent.RunInput{
+		Request: core.RuntimeRequest{Prompt: "prompt"},
+		Mode: core.ResolvedMode{
+			Name:           "tool",
+			Model:          "model",
+			Tools:          []string{"write_file"},
+			MaxSteps:       4,
+			MaxToolRetries: 2,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if output.Result.Result != "wrapped up" {
+		t.Fatalf("result = %q", output.Result.Result)
+	}
+	if tool.execCount != 0 {
+		t.Fatalf("tool executed %d times", tool.execCount)
+	}
+	found := false
+	for _, msg := range output.NewMessages {
+		if msg.Role == "tool" && msg.Name == "write_file" && strings.Contains(msg.Content, "validate write_file arguments") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected validation error tool message, got %+v", output.NewMessages)
+	}
+}
+
+func TestRunnerInvalidToolArgumentsHonorFailFast(t *testing.T) {
+	provider := &fakeProvider{
+		responses: []core.CompletionResponse{
+			{
+				AssistantMessage: core.Message{Role: "assistant"},
+				ToolCalls: []core.ToolCallRequest{{
+					ID:        "1",
+					Name:      "write_file",
+					Arguments: json.RawMessage(`{"path":7}`),
+				}},
+			},
+		},
+	}
+	registry := tools.NewRegistry()
+	tool := &fakeTool{
+		spec: core.ToolSpec{
+			Name:        "write_file",
+			InputSchema: json.RawMessage(`{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}`),
+		},
+		result: core.ToolResult{ToolName: "write_file", Status: "ok", Content: "should not run"},
+	}
+	if err := registry.Register(tool); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &agent.Runner{Provider: provider, Tools: registry}
+	_, err := runner.Run(context.Background(), agent.RunInput{
+		Request: core.RuntimeRequest{Prompt: "prompt", FailOnToolError: true},
+		Mode: core.ResolvedMode{
+			Name:           "tool",
+			Model:          "model",
+			Tools:          []string{"write_file"},
+			MaxSteps:       4,
+			MaxToolRetries: 2,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	exitErr, ok := err.(*cerr.ExitCodeError)
+	if !ok || exitErr.Code != cerr.ExitToolFailure {
+		t.Fatalf("error = %#v", err)
+	}
+	if tool.execCount != 0 {
+		t.Fatalf("tool executed %d times", tool.execCount)
 	}
 }
 

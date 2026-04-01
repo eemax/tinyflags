@@ -10,6 +10,7 @@ import (
 	"github.com/eemax/tinyflags/internal/core"
 	cerr "github.com/eemax/tinyflags/internal/errors"
 	"github.com/eemax/tinyflags/internal/provider"
+	"github.com/eemax/tinyflags/internal/schema"
 	"github.com/eemax/tinyflags/internal/tools"
 )
 
@@ -153,7 +154,7 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 						return RunOutput{}, r.joinWithHookError(ctx, err)
 					}
 				}
-				result, execErr := tool.Execute(ctx, call, input.ExecContext)
+				result, execErr := executeToolCall(ctx, tool, call, input.ExecContext)
 				execErr = normalizeContextError(ctx, execErr)
 				if result.ToolCallID == "" {
 					result.ToolCallID = call.ID
@@ -271,7 +272,8 @@ func normalizeContextError(ctx context.Context, err error) error {
 }
 
 func schemaInstruction(schemaBytes []byte) string {
-	return fmt.Sprintf("You must return valid JSON only. The final assistant response must satisfy this JSON schema:\n%s", string(schemaBytes))
+	_ = schemaBytes
+	return "Return valid JSON only. Do not wrap it in markdown or add explanatory text."
 }
 
 func joinText(parts ...string) string {
@@ -320,6 +322,23 @@ func budgetExceeded(failures, budget int) bool {
 
 func forkedFrom(req core.RuntimeRequest) string {
 	return req.ForkedFrom
+}
+
+func executeToolCall(ctx context.Context, tool tools.Tool, call core.ToolCallRequest, execCtx tools.ExecContext) (core.ToolResult, error) {
+	spec := tool.Spec()
+	if len(spec.InputSchema) == 0 {
+		return tool.Execute(ctx, call, execCtx)
+	}
+	if _, err := schema.ValidateJSON(ctx, spec.InputSchema, call.Arguments); err != nil {
+		execErr := cerr.Wrap(cerr.ExitToolFailure, fmt.Sprintf("validate %s arguments", call.Name), err)
+		return core.ToolResult{
+			ToolCallID: call.ID,
+			ToolName:   call.Name,
+			Status:     "error",
+			Content:    execErr.Error(),
+		}, execErr
+	}
+	return tool.Execute(ctx, call, execCtx)
 }
 
 func (r *Runner) emitError(ctx context.Context, err error) {
