@@ -225,11 +225,7 @@ func (a *App) executeRun(ctx context.Context, cmd *cobra.Command, args []string,
 		return withFormat(cerr.New(cerr.ExitCLIUsage, "--fork-session requires --session"), opts.format)
 	}
 
-	cfg, _, err := config.Load(opts.configPath)
-	if err != nil {
-		return withFormat(err, opts.format)
-	}
-	formatHint := firstNonEmpty(opts.format, cfg.DefaultFormat)
+	formatHint := firstNonEmpty(opts.format, "text")
 	request := core.RuntimeRequest{
 		Prompt:          args[0],
 		ModeName:        opts.mode,
@@ -252,6 +248,19 @@ func (a *App) executeRun(ctx context.Context, cmd *cobra.Command, args []string,
 		Debug:           opts.debug,
 		ConfigPath:      opts.configPath,
 	}
+	resolvedCWD, err := a.resolveCWD(request.CWD)
+	if err != nil {
+		return withFormat(err, formatHint)
+	}
+	request.CWD = resolvedCWD
+
+	cfg, _, err := config.LoadFromAnchor(opts.configPath, resolvedCWD)
+	if err != nil {
+		return withFormat(err, formatHint)
+	}
+	if opts.format == "" {
+		formatHint = cfg.DefaultFormat
+	}
 
 	resolvedMode, err := mode.Resolve(cfg, request)
 	if err != nil {
@@ -273,15 +282,6 @@ func (a *App) executeRun(ctx context.Context, cmd *cobra.Command, args []string,
 	if err := invocationTimeoutError(runCtx); err != nil {
 		return withFormat(err, formatHint)
 	}
-	resolvedCWD, err := a.resolveCWD(request.CWD)
-	if err != nil {
-		return withFormat(err, formatHint)
-	}
-	request.CWD = resolvedCWD
-	if err := invocationTimeoutError(runCtx); err != nil {
-		return withFormat(err, formatHint)
-	}
-
 	skillText := ""
 	if request.SkillName != "" {
 		skillText, _, err = skill.Load(request.SkillName, request.CWD, cfg)
@@ -579,7 +579,7 @@ func (a *App) newModeCommand(globals *globalOptions) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, _, err := config.Load(globals.configPath)
+			cfg, _, err := a.loadCommandConfig(globals.configPath)
 			if err != nil {
 				return err
 			}
@@ -598,7 +598,7 @@ func (a *App) newModeCommand(globals *globalOptions) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, _, err := config.Load(globals.configPath)
+			cfg, _, err := a.loadCommandConfig(globals.configPath)
 			if err != nil {
 				return err
 			}
@@ -623,7 +623,7 @@ func (a *App) newSkillCommand(globals *globalOptions) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, _, err := config.Load(globals.configPath)
+			cfg, _, err := a.loadCommandConfig(globals.configPath)
 			if err != nil {
 				return err
 			}
@@ -651,7 +651,7 @@ func (a *App) newSkillCommand(globals *globalOptions) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, _, err := config.Load(globals.configPath)
+			cfg, _, err := a.loadCommandConfig(globals.configPath)
 			if err != nil {
 				return err
 			}
@@ -678,7 +678,7 @@ func (a *App) newConfigCommand(globals *globalOptions) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, _, err := config.Load(globals.configPath)
+			cfg, _, err := a.loadCommandConfig(globals.configPath)
 			if err != nil {
 				return err
 			}
@@ -694,7 +694,7 @@ func (a *App) newConfigCommand(globals *globalOptions) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, path, err := config.Load(globals.configPath)
+			_, path, err := a.loadCommandConfig(globals.configPath)
 			if err != nil {
 				return err
 			}
@@ -707,7 +707,7 @@ func (a *App) newConfigCommand(globals *globalOptions) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, path, err := config.Load(globals.configPath)
+			cfg, path, err := a.loadCommandConfig(globals.configPath)
 			if err != nil {
 				return err
 			}
@@ -749,7 +749,7 @@ func (a *App) newDoctorCommand(globals *globalOptions) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, path, err := config.Load(globals.configPath)
+			cfg, path, err := a.loadCommandConfig(globals.configPath)
 			if err != nil {
 				return err
 			}
@@ -868,7 +868,7 @@ func (a *App) newVersionCommand() *cobra.Command {
 }
 
 func (a *App) sessionAdmin(configPath string) (*sql.DB, session.AdminStore, error) {
-	cfg, _, err := config.Load(configPath)
+	cfg, _, err := a.loadCommandConfig(configPath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -877,6 +877,14 @@ func (a *App) sessionAdmin(configPath string) (*sql.DB, session.AdminStore, erro
 		return nil, nil, err
 	}
 	return db, session.NewSQLiteStore(db), nil
+}
+
+func (a *App) loadCommandConfig(configPath string) (core.Config, string, error) {
+	anchor, err := a.resolveCWD("")
+	if err != nil {
+		return core.Config{}, "", err
+	}
+	return config.LoadFromAnchor(configPath, anchor)
 }
 
 func (a *App) newRenderer(format string, resultOnly bool) output.Renderer {

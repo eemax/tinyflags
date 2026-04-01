@@ -2,9 +2,17 @@ package mode
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/eemax/tinyflags/internal/core"
 	cerr "github.com/eemax/tinyflags/internal/errors"
+)
+
+type modelValueSource int
+
+const (
+	modelSourceConfigured modelValueSource = iota
+	modelSourceCLIOverride
 )
 
 func Resolve(cfg core.Config, req core.RuntimeRequest) (core.ResolvedMode, error) {
@@ -17,7 +25,8 @@ func Resolve(cfg core.Config, req core.RuntimeRequest) (core.ResolvedMode, error
 		return core.ResolvedMode{}, cerr.New(cerr.ExitCLIUsage, fmt.Sprintf("mode %q not found", name))
 	}
 
-	modelName, err := resolveModel(cfg, firstNonEmpty(req.ModelOverride, modeCfg.Model, cfg.DefaultModel))
+	modelValue, modelSource := selectModelValue(req.ModelOverride, modeCfg.Model, cfg.DefaultModel)
+	modelName, err := resolveModel(cfg, modelValue, modelSource)
 	if err != nil {
 		return core.ResolvedMode{}, err
 	}
@@ -68,14 +77,29 @@ func Resolve(cfg core.Config, req core.RuntimeRequest) (core.ResolvedMode, error
 	}, nil
 }
 
-func resolveModel(cfg core.Config, name string) (string, error) {
-	if name == "" {
+func selectModelValue(override, modeModel, defaultModel string) (string, modelValueSource) {
+	if override != "" {
+		return override, modelSourceCLIOverride
+	}
+	return firstNonEmpty(modeModel, defaultModel), modelSourceConfigured
+}
+
+func resolveModel(cfg core.Config, name string, source modelValueSource) (string, error) {
+	value := strings.TrimSpace(name)
+	if value == "" {
 		return "", cerr.New(cerr.ExitCLIUsage, "model is required")
 	}
-	if resolved, ok := cfg.Models[name]; ok {
+	if resolved, ok := cfg.Models[value]; ok {
 		return resolved, nil
 	}
-	return name, nil
+	if strings.Contains(value, "/") {
+		return value, nil
+	}
+	code := cerr.ExitRuntime
+	if source == modelSourceCLIOverride {
+		code = cerr.ExitCLIUsage
+	}
+	return "", cerr.New(code, fmt.Sprintf("unknown model alias %q", value))
 }
 
 func firstNonEmpty(values ...string) string {

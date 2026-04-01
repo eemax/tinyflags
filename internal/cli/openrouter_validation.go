@@ -95,10 +95,17 @@ func evaluateModelRequirements(ctx context.Context, requirements []modelRequirem
 }
 
 func configModelRequirements(cfg core.Config) ([]modelRequirement, error) {
-	requirements := []modelRequirement{{
-		Name:  "default_model",
-		Model: resolveConfiguredModel(cfg, cfg.DefaultModel),
-	}}
+	requirements := []modelRequirement{}
+	if strings.TrimSpace(cfg.DefaultModel) != "" {
+		modelName, err := resolveConfiguredModel(cfg, cfg.DefaultModel)
+		if err != nil {
+			return nil, err
+		}
+		requirements = append(requirements, modelRequirement{
+			Name:  "default_model",
+			Model: modelName,
+		})
+	}
 	defaultResolved, err := mode.Resolve(cfg, core.RuntimeRequest{
 		MaxSteps:       -1,
 		MaxToolRetries: -1,
@@ -136,11 +143,18 @@ func configModelRequirements(cfg core.Config) ([]modelRequirement, error) {
 	return requirements, nil
 }
 
-func resolveConfiguredModel(cfg core.Config, value string) string {
-	if resolved, ok := cfg.Models[value]; ok {
-		return resolved
+func resolveConfiguredModel(cfg core.Config, value string) (string, error) {
+	name := strings.TrimSpace(value)
+	if name == "" {
+		return "", cerr.New(cerr.ExitCLIUsage, "model is required")
 	}
-	return value
+	if resolved, ok := cfg.Models[name]; ok {
+		return resolved, nil
+	}
+	if strings.Contains(name, "/") {
+		return name, nil
+	}
+	return "", cerr.New(cerr.ExitRuntime, fmt.Sprintf("unknown model alias %q", name))
 }
 
 func requiredModelFeatures(modeCfg core.ResolvedMode, schemaRequired bool) []string {

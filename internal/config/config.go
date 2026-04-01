@@ -38,12 +38,19 @@ func DefaultConfigPath() (string, error) {
 	return filepath.Join(home, ".tinyflags", "config.toml"), nil
 }
 
+func DefaultModelsPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".tinyflags", "models.toml"), nil
+}
+
 func DefaultConfig() core.Config {
 	return core.Config{
 		Version:        1,
 		BaseURL:        "https://openrouter.ai/api/v1",
 		DefaultMode:    "commander",
-		DefaultModel:   "openai/gpt-4o-mini",
 		DefaultFormat:  "text",
 		DBPath:         "~/.tinyflags/tinyflags.db",
 		SkillsDir:      "~/.tinyflags/skills",
@@ -53,15 +60,10 @@ func DefaultConfig() core.Config {
 		MaxSteps:       12,
 		MaxToolRetries: 3,
 		LogLevel:       "error",
-		Models: map[string]string{
-			"fast":  "openai/gpt-4o-mini",
-			"smart": "anthropic/claude-opus-4.5",
-			"ops":   "openai/gpt-4.1",
-		},
+		Models:         map[string]string{},
 		Modes: map[string]core.ModeConfig{
 			"text": {
 				Description:     "Plain text interaction",
-				Model:           "fast",
 				Format:          "text",
 				Tools:           []string{},
 				PersistSession:  true,
@@ -74,7 +76,6 @@ func DefaultConfig() core.Config {
 			},
 			"tool": {
 				Description:     "Bounded tool-enabled mode",
-				Model:           "smart",
 				Format:          "text",
 				Tools:           []string{"read_file", "write_file"},
 				PersistSession:  true,
@@ -87,7 +88,6 @@ func DefaultConfig() core.Config {
 			},
 			"commander": {
 				Description:     "Full shell execution mode",
-				Model:           "ops",
 				Format:          "text",
 				Tools:           []string{"bash"},
 				PersistSession:  true,
@@ -106,23 +106,19 @@ func DefaultConfig() core.Config {
 }
 
 func Load(configPath string) (core.Config, string, error) {
+	return LoadFromAnchor(configPath, "")
+}
+
+func LoadFromAnchor(configPath, anchor string) (core.Config, string, error) {
 	cfg := cloneConfig(DefaultConfig())
-	path := configPath
-	if strings.TrimSpace(path) == "" {
-		var err error
-		path, err = DefaultConfigPath()
-		if err != nil {
-			return core.Config{}, "", cerr.Wrap(cerr.ExitRuntime, "resolve default config path", err)
-		}
-	}
-	path, err := ExpandPath(path)
+	discovered, err := discoverConfigPath(configPath, anchor)
 	if err != nil {
-		return core.Config{}, "", cerr.Wrap(cerr.ExitRuntime, "expand config path", err)
+		return core.Config{}, "", err
 	}
 
-	if _, err := os.Stat(path); err == nil {
+	if discovered.LoadPath != "" {
 		fileCfg := core.Config{}
-		meta, err := toml.DecodeFile(path, &fileCfg)
+		meta, err := toml.DecodeFile(discovered.LoadPath, &fileCfg)
 		if err != nil {
 			return core.Config{}, "", cerr.Wrap(cerr.ExitRuntime, "parse config", err)
 		}
@@ -133,8 +129,6 @@ func Load(configPath string) (core.Config, string, error) {
 			return core.Config{}, "", cerr.New(cerr.ExitRuntime, fmt.Sprintf("config version %d is incompatible with this build, please migrate", fileCfg.Version))
 		}
 		cfg = mergeConfig(cfg, fileCfg, meta)
-	} else if !os.IsNotExist(err) {
-		return core.Config{}, "", cerr.Wrap(cerr.ExitRuntime, "read config", err)
 	}
 
 	if err := applyEnv(&cfg, os.LookupEnv); err != nil {
@@ -148,6 +142,12 @@ func Load(configPath string) (core.Config, string, error) {
 		return core.Config{}, "", cerr.New(cerr.ExitRuntime, fmt.Sprintf("config version %d is incompatible with this build, please migrate", cfg.Version))
 	}
 
+	models, err := loadModels(modelDiscoveryAnchor(discovered, anchor))
+	if err != nil {
+		return core.Config{}, "", err
+	}
+	cfg.Models = models
+
 	if cfg.DBPath, err = ExpandPath(cfg.DBPath); err != nil {
 		return core.Config{}, "", cerr.Wrap(cerr.ExitRuntime, "expand db path", err)
 	}
@@ -155,7 +155,7 @@ func Load(configPath string) (core.Config, string, error) {
 		return core.Config{}, "", cerr.Wrap(cerr.ExitRuntime, "expand skills dir", err)
 	}
 
-	return cfg, path, nil
+	return cfg, discovered.DisplayPath, nil
 }
 
 func ExpandPath(path string) (string, error) {
@@ -278,9 +278,6 @@ func mergeConfig(base, override core.Config, meta toml.MetaData) core.Config {
 	if override.PlanModeInstruction != "" {
 		out.PlanModeInstruction = override.PlanModeInstruction
 	}
-	for key, value := range override.Models {
-		out.Models[key] = value
-	}
 	for key, value := range override.Modes {
 		baseMode, ok := out.Modes[key]
 		if !ok {
@@ -292,6 +289,169 @@ func mergeConfig(base, override core.Config, meta toml.MetaData) core.Config {
 		out.Skills[key] = value
 	}
 	return out
+}
+
+type discoveredConfigPath struct {
+	LoadPath    string
+	DisplayPath string
+}
+
+type modelCatalogFile struct {
+	Models map[string]modelCatalogEntry `toml:"models"`
+}
+
+type modelCatalogEntry struct {
+	ID string `toml:"id"`
+}
+
+func modelDiscoveryAnchor(discovered discoveredConfigPath, fallback string) string {
+	if strings.TrimSpace(discovered.DisplayPath) != "" {
+		return discovered.DisplayPath
+	}
+	return fallback
+}
+
+func discoverConfigPath(configPath, anchor string) (discoveredConfigPath, error) {
+	if strings.TrimSpace(configPath) != "" {
+		path, err := ExpandPath(configPath)
+		if err != nil {
+			return discoveredConfigPath{}, cerr.Wrap(cerr.ExitRuntime, "expand config path", err)
+		}
+		if _, err := os.Stat(path); err == nil {
+			return discoveredConfigPath{LoadPath: path, DisplayPath: path}, nil
+		} else if !os.IsNotExist(err) {
+			return discoveredConfigPath{}, cerr.Wrap(cerr.ExitRuntime, "read config", err)
+		}
+		return discoveredConfigPath{DisplayPath: path}, nil
+	}
+
+	path, err := DefaultConfigPath()
+	if err != nil {
+		return discoveredConfigPath{}, cerr.Wrap(cerr.ExitRuntime, "resolve default config path", err)
+	}
+	if _, err := os.Stat(path); err == nil {
+		return discoveredConfigPath{LoadPath: path, DisplayPath: path}, nil
+	} else if !os.IsNotExist(err) {
+		return discoveredConfigPath{}, cerr.Wrap(cerr.ExitRuntime, "read config", err)
+	}
+
+	searchAnchor, err := resolveSearchAnchor(anchor)
+	if err != nil {
+		return discoveredConfigPath{}, err
+	}
+	path, err = findUpward(searchAnchor, "config.toml")
+	if err != nil {
+		return discoveredConfigPath{}, cerr.Wrap(cerr.ExitRuntime, "search config", err)
+	}
+	if path == "" {
+		return discoveredConfigPath{}, nil
+	}
+	return discoveredConfigPath{LoadPath: path, DisplayPath: path}, nil
+}
+
+func loadModels(anchor string) (map[string]string, error) {
+	searchAnchor, err := resolveSearchAnchor(anchor)
+	if err != nil {
+		return nil, err
+	}
+	models := map[string]string{}
+
+	repoPath, err := findUpward(searchAnchor, "models.toml")
+	if err != nil {
+		return nil, cerr.Wrap(cerr.ExitRuntime, "search models", err)
+	}
+	if repoPath != "" {
+		items, err := loadModelsFile(repoPath)
+		if err != nil {
+			return nil, err
+		}
+		for alias, id := range items {
+			models[alias] = id
+		}
+	}
+
+	homePath, err := DefaultModelsPath()
+	if err != nil {
+		return nil, cerr.Wrap(cerr.ExitRuntime, "resolve default models path", err)
+	}
+	if _, err := os.Stat(homePath); err == nil {
+		items, err := loadModelsFile(homePath)
+		if err != nil {
+			return nil, err
+		}
+		for alias, id := range items {
+			models[alias] = id
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, cerr.Wrap(cerr.ExitRuntime, "read models", err)
+	}
+
+	return models, nil
+}
+
+func loadModelsFile(path string) (map[string]string, error) {
+	decoded := modelCatalogFile{}
+	if _, err := toml.DecodeFile(path, &decoded); err != nil {
+		return nil, cerr.Wrap(cerr.ExitRuntime, fmt.Sprintf("parse models file %s", path), err)
+	}
+	out := make(map[string]string, len(decoded.Models))
+	for alias, entry := range decoded.Models {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			return nil, cerr.New(cerr.ExitRuntime, fmt.Sprintf("models file %s contains a blank alias", path))
+		}
+		id := strings.TrimSpace(entry.ID)
+		if id == "" {
+			return nil, cerr.New(cerr.ExitRuntime, fmt.Sprintf("models file %s has no id for alias %q", path, alias))
+		}
+		out[alias] = id
+	}
+	return out, nil
+}
+
+func resolveSearchAnchor(anchor string) (string, error) {
+	value := strings.TrimSpace(anchor)
+	if value == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", cerr.Wrap(cerr.ExitRuntime, "resolve current directory", err)
+		}
+		return filepath.Clean(cwd), nil
+	}
+	value, err := ExpandPath(value)
+	if err != nil {
+		return "", cerr.Wrap(cerr.ExitRuntime, "expand search anchor", err)
+	}
+	if filepath.IsAbs(value) {
+		return filepath.Clean(value), nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", cerr.Wrap(cerr.ExitRuntime, "resolve current directory", err)
+	}
+	return filepath.Clean(filepath.Join(cwd, value)), nil
+}
+
+func findUpward(start, name string) (string, error) {
+	dir := filepath.Clean(start)
+	if info, err := os.Stat(dir); err == nil && !info.IsDir() {
+		dir = filepath.Dir(dir)
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	for {
+		path := filepath.Join(dir, name)
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path, nil
+		} else if err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", nil
+		}
+		dir = parent
+	}
 }
 
 func cloneConfig(in core.Config) core.Config {

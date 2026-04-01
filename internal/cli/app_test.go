@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,6 +206,237 @@ func TestAppModeShowResolved(t *testing.T) {
 	}
 	if payload["model"] != "openai/gpt-4.1" {
 		t.Fatalf("model = %#v", payload["model"])
+	}
+}
+
+func TestAppConfigPathDiscoversRepoConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	repo := filepath.Join(t.TempDir(), "repo")
+	nested := filepath.Join(repo, "pkg")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "config.toml"), []byte("version = 1\ndefault_mode = \"text\"\ndefault_model = \"openai/gpt-4o-mini\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app := cli.NewApp(&bytes.Buffer{}, &bytes.Buffer{})
+	stdout := &bytes.Buffer{}
+	app.Stdout = stdout
+
+	restoreCWD(t, nested)
+
+	code := app.Execute([]string{"--format", "json", "config", "path"})
+	if code != 0 {
+		t.Fatalf("exit code = %d stdout=%q", code, stdout.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v", err)
+	}
+	wantPath, err := filepath.EvalSymlinks(filepath.Join(repo, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload["path"] != wantPath {
+		t.Fatalf("path = %#v", payload["path"])
+	}
+}
+
+func TestAppRunUsesRepoConfigAndModelsToml(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	repo := filepath.Join(t.TempDir(), "repo")
+	nested := filepath.Join(repo, "pkg")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "config.toml"), []byte("version = 1\ndefault_mode = \"text\"\ndefault_model = \"fast\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "models.toml"), []byte("[models.fast]\nid = \"openai/gpt-4o-mini\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &scriptedProvider{
+		responses: []core.CompletionResponse{{AssistantMessage: core.Message{Role: "assistant", Content: "done"}}},
+	}
+	app := cli.NewApp(&bytes.Buffer{}, &bytes.Buffer{})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app.Stdout = stdout
+	app.Stderr = stderr
+	registry := provider.NewRegistry()
+	registry.Register("openrouter", fake)
+	app.ProviderRegistry = registry
+
+	restoreCWD(t, nested)
+
+	code := app.Execute([]string{"hello"})
+	if code != 0 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("requests = %+v", fake.requests)
+	}
+	if fake.requests[0].Model != "openai/gpt-4o-mini" {
+		t.Fatalf("model = %q", fake.requests[0].Model)
+	}
+}
+
+func TestAppModeShowUsesEnvDefaultModel(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TINYFLAGS_DEFAULT_MODE", "text")
+	t.Setenv("TINYFLAGS_DEFAULT_MODEL", "openai/gpt-4o-mini")
+
+	app := cli.NewApp(&bytes.Buffer{}, &bytes.Buffer{})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app.Stdout = stdout
+	app.Stderr = stderr
+
+	code := app.Execute([]string{"--format", "json", "mode", "show", "text"})
+	if code != 0 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v", err)
+	}
+	if payload["model"] != "openai/gpt-4o-mini" {
+		t.Fatalf("model = %#v", payload["model"])
+	}
+}
+
+func TestAppModeShowFailsWithoutAnyConfiguredModel(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	app := cli.NewApp(&bytes.Buffer{}, &bytes.Buffer{})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app.Stdout = stdout
+	app.Stderr = stderr
+
+	restoreCWD(t, t.TempDir())
+
+	code := app.Execute([]string{"mode", "show", "text"})
+	if code != 8 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "model is required") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestAppRunWithExplicitConfigUsesModelsTomlFromConfigRepo(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	repo := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(repo, "config.toml")
+	if err := os.WriteFile(configPath, []byte("version = 1\ndefault_mode = \"text\"\ndefault_model = \"repofast\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "models.toml"), []byte("[models.repofast]\nid = \"openai/gpt-4o-mini\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreCWD(t, t.TempDir())
+
+	fake := &scriptedProvider{
+		responses: []core.CompletionResponse{{AssistantMessage: core.Message{Role: "assistant", Content: "done"}}},
+	}
+	app := cli.NewApp(&bytes.Buffer{}, &bytes.Buffer{})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app.Stdout = stdout
+	app.Stderr = stderr
+	registry := provider.NewRegistry()
+	registry.Register("openrouter", fake)
+	app.ProviderRegistry = registry
+
+	code := app.Execute([]string{"--config", configPath, "hello"})
+	if code != 0 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("requests = %+v", fake.requests)
+	}
+	if fake.requests[0].Model != "openai/gpt-4o-mini" {
+		t.Fatalf("model = %q", fake.requests[0].Model)
+	}
+}
+
+func TestAppRunAcceptsFullModelIDWithoutModelsToml(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	fake := &scriptedProvider{
+		responses: []core.CompletionResponse{{AssistantMessage: core.Message{Role: "assistant", Content: "done"}}},
+	}
+	app, stdout, stderr, cfgPath := newTestAppWithExtraConfig(t, fake, "default_mode = \"text\"\ndefault_model = \"\"\n")
+
+	code := app.Execute([]string{"--config", cfgPath, "--mode", "text", "--model", "openai/gpt-4o-mini", "hello"})
+	if code != 0 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("requests = %+v", fake.requests)
+	}
+	if fake.requests[0].Model != "openai/gpt-4o-mini" {
+		t.Fatalf("model = %q", fake.requests[0].Model)
+	}
+}
+
+func TestAppRunRejectsUnknownCLIModelAliasAsUsage(t *testing.T) {
+	app, stdout, stderr, cfgPath := newTestApp(t, &scriptedProvider{})
+
+	code := app.Execute([]string{"--config", cfgPath, "--format", "json", "--mode", "text", "--model", "fast", "hello"})
+	if code != 8 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v", err)
+	}
+	errorPayload, ok := payload["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("error payload = %#v", payload["error"])
+	}
+	if errorPayload["type"] != "invalid_cli_usage" {
+		t.Fatalf("error type = %#v", errorPayload["type"])
+	}
+}
+
+func TestAppModeShowTreatsBadEnvAliasAsRuntime(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TINYFLAGS_DEFAULT_MODE", "text")
+	t.Setenv("TINYFLAGS_DEFAULT_MODEL", "fast")
+
+	app := cli.NewApp(&bytes.Buffer{}, &bytes.Buffer{})
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	app.Stdout = stdout
+	app.Stderr = stderr
+
+	restoreCWD(t, t.TempDir())
+
+	code := app.Execute([]string{"--format", "json", "mode", "show", "text"})
+	if code != 1 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v", err)
+	}
+	errorPayload, ok := payload["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("error payload = %#v", payload["error"])
+	}
+	if errorPayload["type"] != "runtime_error" {
+		t.Fatalf("error type = %#v", errorPayload["type"])
 	}
 }
 
@@ -408,7 +640,7 @@ func TestAppConfigValidateFailsOnUnsupportedModel(t *testing.T) {
 		{"id": "openai/gpt-4o-mini", "name": "GPT-4o mini", "supported_parameters": []string{"response_format"}},
 		{"id": "openai/gpt-4.1", "name": "GPT-4.1", "supported_parameters": []string{"tools"}},
 	}, nil)
-	app, stdout, stderr, cfgPath := newTestAppWithExtraConfig(t, &scriptedProvider{}, "base_url = \""+server.URL+"\"\n")
+	app, stdout, stderr, cfgPath := newTestAppWithExtraConfig(t, &scriptedProvider{}, "base_url = \""+server.URL+"\"\ndefault_model = \"openai/gpt-4o-mini\"\n")
 	app.HTTPClient = server.Client()
 
 	code := app.Execute([]string{"--config", cfgPath, "--format", "json", "config", "validate"})
@@ -424,7 +656,28 @@ func TestAppConfigValidateFailsOnUnsupportedModel(t *testing.T) {
 	}
 }
 
+func TestAppConfigValidateTreatsBadConfiguredAliasAsRuntime(t *testing.T) {
+	app, stdout, stderr, cfgPath := newTestAppWithExtraConfig(t, &scriptedProvider{}, "default_model = \"fast\"\n")
+
+	code := app.Execute([]string{"--config", cfgPath, "--format", "json", "config", "validate"})
+	if code != 1 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	errorPayload, ok := payload["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("error payload = %#v", payload["error"])
+	}
+	if errorPayload["type"] != "runtime_error" {
+		t.Fatalf("error type = %#v", errorPayload["type"])
+	}
+}
+
 func TestAppRunFailsPreflightWhenModelLacksTools(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	var chatCalls int
 	server := newModelCatalogServer(t, http.StatusOK, []map[string]any{
 		{"id": "openai/gpt-4o-mini", "name": "GPT-4o mini", "supported_parameters": []string{"response_format", "structured_outputs"}},
@@ -456,7 +709,7 @@ func TestAppRunFailsPreflightWhenModelLacksTools(t *testing.T) {
 		"base_url = \"" + server.URL + "\"\n" +
 		"db_path = \"" + dbPath + "\"\n" +
 		"skills_dir = \"" + skillsDir + "\"\n" +
-		"[modes.tool]\nmodel = \"fast\"\n"
+		"[modes.tool]\nmodel = \"openai/gpt-4o-mini\"\n"
 	if err := os.WriteFile(cfgPath, []byte(configText), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -471,6 +724,7 @@ func TestAppRunFailsPreflightWhenModelLacksTools(t *testing.T) {
 }
 
 func TestAppRunPreflightUsesInjectedOpenRouterClientCatalog(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	var configModelCalls int
 	configServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/models" {
@@ -533,7 +787,8 @@ func TestAppRunPreflightUsesInjectedOpenRouterClientCatalog(t *testing.T) {
 		"api_key = \"secret\"\n" +
 		"base_url = \"" + configServer.URL + "\"\n" +
 		"db_path = \"" + dbPath + "\"\n" +
-		"skills_dir = \"" + skillsDir + "\"\n"
+		"skills_dir = \"" + skillsDir + "\"\n" +
+		"default_model = \"anthropic/claude-opus-4.5\"\n"
 	if err := os.WriteFile(cfgPath, []byte(configText), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -557,6 +812,7 @@ func TestAppRunPreflightUsesInjectedOpenRouterClientCatalog(t *testing.T) {
 }
 
 func TestAppRunFailsPreflightWhenSchemaModelLacksResponseFormat(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	var chatCalls int
 	server := newModelCatalogServer(t, http.StatusOK, []map[string]any{
 		{"id": "openai/gpt-4o-mini", "name": "GPT-4o mini", "supported_parameters": []string{"structured_outputs"}},
@@ -591,7 +847,8 @@ func TestAppRunFailsPreflightWhenSchemaModelLacksResponseFormat(t *testing.T) {
 		"api_key = \"secret\"\n" +
 		"base_url = \"" + server.URL + "\"\n" +
 		"db_path = \"" + dbPath + "\"\n" +
-		"skills_dir = \"" + skillsDir + "\"\n"
+		"skills_dir = \"" + skillsDir + "\"\n" +
+		"default_model = \"openai/gpt-4o-mini\"\n"
 	if err := os.WriteFile(cfgPath, []byte(configText), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -609,6 +866,7 @@ func TestAppRunFailsPreflightWhenSchemaModelLacksResponseFormat(t *testing.T) {
 }
 
 func TestAppRunSkipsSlowGenerationMetadataNearTimeout(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	var generationCalls int
 	server := newModelCatalogServer(t, http.StatusOK, defaultCatalogModels(), func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -655,7 +913,8 @@ func TestAppRunSkipsSlowGenerationMetadataNearTimeout(t *testing.T) {
 		"api_key = \"secret\"\n" +
 		"base_url = \"" + server.URL + "\"\n" +
 		"db_path = \"" + dbPath + "\"\n" +
-		"skills_dir = \"" + skillsDir + "\"\n"
+		"skills_dir = \"" + skillsDir + "\"\n" +
+		"default_model = \"openai/gpt-4o-mini\"\n"
 	if err := os.WriteFile(cfgPath, []byte(configText), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -766,12 +1025,29 @@ func TestAppLinksPersistedSessionMessagesToRun(t *testing.T) {
 	}
 }
 
+func restoreCWD(t *testing.T, dir string) {
+	t.Helper()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previous); err != nil {
+			t.Fatalf("restore cwd: %v", err)
+		}
+	})
+}
+
 func newTestApp(t *testing.T, fake provider.Provider) (*cli.App, *bytes.Buffer, *bytes.Buffer, string) {
 	return newTestAppWithExtraConfig(t, fake, "")
 }
 
 func newTestAppWithExtraConfig(t *testing.T, fake provider.Provider, extraConfig string) (*cli.App, *bytes.Buffer, *bytes.Buffer, string) {
 	t.Helper()
+	t.Setenv("HOME", t.TempDir())
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	app := cli.NewApp(stdout, stderr)
@@ -786,7 +1062,12 @@ func newTestAppWithExtraConfig(t *testing.T, fake provider.Provider, extraConfig
 	if err := os.MkdirAll(skillsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	defaultModel := ""
+	if !strings.Contains(extraConfig, "default_model") {
+		defaultModel = "default_model = \"openai/gpt-4.1\"\n"
+	}
 	configText := "version = 1\n" +
+		defaultModel +
 		"db_path = \"" + dbPath + "\"\n" +
 		"skills_dir = \"" + skillsDir + "\"\n" +
 		extraConfig

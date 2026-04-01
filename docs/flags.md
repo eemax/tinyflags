@@ -31,7 +31,7 @@ These flags are available on the root command and inherited by subcommands:
 
 | Flag | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `--config` | string | `~/.tinyflags/config.toml` | Override config file location |
+| `--config` | string | empty | Override config file location |
 | `--format` | string | resolved mode format or `text` | `text` or `json` |
 | `--result-only` | bool | `false` | For JSON output, emit only the result payload |
 | `--verbose` | bool | `false` | Enable stderr operational summaries for the current run |
@@ -42,6 +42,7 @@ Notes:
 - Unsupported `--format` values fail with exit code `8`.
 - When the effective run format resolves to `json` through flags, mode settings, or config defaults, failures are emitted as JSON error envelopes on `stdout`.
 - By default, stderr is quiet except for failures. `--verbose` promotes the run log level to `info`, and `--debug` promotes it to `debug`.
+- When `--config` is not set, config discovery checks `~/.tinyflags/config.toml`, then the nearest repo `config.toml` walking up from the command anchor, then falls back to built-in defaults for non-model settings.
 
 ## Run Flags
 
@@ -54,7 +55,7 @@ These flags apply to `tinyflags "prompt"` and `tinyflags run "prompt"`:
 | `--fork-session` | string | empty | Requires `--session`; forks the source session and runs against the fork |
 | `--system` | string | empty | Inline system prompt layer |
 | `--skill` | string | empty | Load named skill content |
-| `--model` | string | empty | Override mode model or model alias |
+| `--model` | string | empty | Override mode model with a full model ID or an alias from discovered `models.toml` |
 | `--output-schema` | string | empty | Path to JSON Schema for native structured-output requests plus final output validation |
 | `--plan` | bool | `false` | Plan-only mode; tools return non-executing results |
 | `--timeout` | duration | resolved from mode/config, default `2m` | Hard cap for the full invocation, including post-loop validation and persistence |
@@ -101,7 +102,7 @@ Subcommands:
 - `path`
 - `validate`
 
-`config validate` resolves the configured modes, checks the default model alias, and validates OpenRouter model compatibility when the public model catalog is reachable. Catalog lookup failures are reported as warnings instead of hard failures.
+`config validate` resolves configured/default models through discovered `models.toml` and validates OpenRouter model compatibility when the public model catalog is reachable. Catalog lookup failures are reported as warnings instead of hard failures.
 
 ### `tinyflags doctor`
 
@@ -160,13 +161,19 @@ Precedence order:
 3. Config file
 4. Built-in defaults
 
+These values come from the inherited OS process environment. `tinyflags` does not auto-load a `.env` file.
+
 ## Config File
 
-Default path:
+Discovery order when `--config` is not set:
 
 ```text
 ~/.tinyflags/config.toml
+nearest repo config.toml walking up from the command anchor
+built-in defaults for non-model settings
 ```
+
+Built-in defaults do not include a runnable model default. Runs still require a model from `--model`, `default_model`, a mode-specific `model`, or `TINYFLAGS_DEFAULT_MODEL`.
 
 Current config keys and defaults:
 
@@ -176,7 +183,7 @@ Current config keys and defaults:
 | `api_key` | string | empty |
 | `base_url` | string | `https://openrouter.ai/api/v1` |
 | `default_mode` | string | `commander` |
-| `default_model` | string | `openai/gpt-4o-mini` |
+| `default_model` | string | empty |
 | `default_format` | string | `text` |
 | `db_path` | string | `~/.tinyflags/tinyflags.db` |
 | `skills_dir` | string | `~/.tinyflags/skills` |
@@ -187,7 +194,6 @@ Current config keys and defaults:
 | `max_tool_retries` | int | `3` |
 | `log_level` | string | `error` |
 | `plan_mode_instruction` | string | empty in config, runtime falls back to built-in plan text |
-| `[models]` | table | shipped aliases shown below |
 | `[modes]` | table | shipped mode definitions shown below |
 | `[skills]` | table | optional inline skill strings |
 
@@ -200,13 +206,30 @@ system = "custom only"
 
 keeps the unspecified `commander` fields intact.
 
-### Shipped Model Aliases
+## Model Catalog File
 
-| Alias | Resolved Model |
-| --- | --- |
-| `fast` | `openai/gpt-4o-mini` |
-| `smart` | `anthropic/claude-opus-4.5` |
-| `ops` | `openai/gpt-4.1` |
+Model aliases are loaded from `models.toml`, not from `config.toml`.
+
+Discovery order:
+
+- When a config file is loaded, search for the nearest `models.toml` walking up from that loaded config path.
+- When `--config` is set and the target file does not exist, search for the nearest `models.toml` walking up from the explicit config path.
+- When no config file is loaded, search for the nearest `models.toml` walking up from the command anchor.
+- In all cases, `~/.tinyflags/models.toml` is loaded after the repo file and wins on conflicts.
+
+If both files exist, entries are merged and the home file wins on conflicts.
+
+Supported format:
+
+```toml
+[models.fast]
+id = "openai/gpt-4o-mini"
+
+[models.smart]
+id = "anthropic/claude-opus-4.5"
+```
+
+Only `id` is read today. Extra keys are ignored for forward compatibility.
 
 ### Shipped Modes
 
@@ -215,7 +238,7 @@ keeps the unspecified `commander` fields intact.
 | Field | Value |
 | --- | --- |
 | `description` | `Plain text interaction` |
-| `model` | `fast` |
+| `model` | empty |
 | `format` | `text` |
 | `tools` | `[]` |
 | `persist_session` | `true` |
@@ -232,7 +255,7 @@ keeps the unspecified `commander` fields intact.
 | Field | Value |
 | --- | --- |
 | `description` | `Bounded tool-enabled mode` |
-| `model` | `smart` |
+| `model` | empty |
 | `format` | `text` |
 | `tools` | `["read_file", "write_file"]` |
 | `persist_session` | `true` |
@@ -249,7 +272,7 @@ keeps the unspecified `commander` fields intact.
 | Field | Value |
 | --- | --- |
 | `description` | `Full shell execution mode` |
-| `model` | `ops` |
+| `model` | empty |
 | `format` | `text` |
 | `tools` | `["bash"]` |
 | `persist_session` | `true` |
@@ -268,7 +291,7 @@ Each mode currently supports:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `description` | string | Human-readable summary |
-| `model` | string | Model alias or full model name |
+| `model` | string | Model alias from discovered `models.toml` or full model name |
 | `format` | string | `text` or `json` |
 | `system` | string | Mode-level system prompt |
 | `tools` | `[]string` | Allowed tool names |

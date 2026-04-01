@@ -11,7 +11,7 @@ By default, stderr stays quiet except for failures. Use `--verbose` or `--debug`
 This repository contains a greenfield v2 implementation with:
 
 - Cobra-based CLI with `run`, `session`, `mode`, `skill`, `config`, `doctor`, and `version` commands
-- Config resolution with explicit precedence: flags > env vars > config file > defaults
+- Config and model discovery with explicit precedence: flags > env vars > discovered config/models files > built-in defaults for non-model settings
 - Explicit provider and tool registries
 - SQLite-backed sessions and run logging
 - OpenRouter Chat Completions provider
@@ -137,21 +137,30 @@ Use `--plan` to request a plan-only run that avoids side effects and causes tool
 
 ## Configuration
 
-Default config path:
+Config discovery when `--config` is not set:
 
 ```text
 ~/.tinyflags/config.toml
+nearest repo config.toml walking up from the command anchor
+built-in defaults for non-model settings
 ```
 
-Minimal example:
+Minimal `config.toml` example:
 
 ```toml
 version = 1
 api_key = "sk-..."
 default_mode = "commander"
+default_model = "openai/gpt-4.1"
 db_path = "~/.tinyflags/tinyflags.db"
 skills_dir = "~/.tinyflags/skills"
 ```
+
+Built-in defaults do not include a runnable model. Runs need a model from `--model`, `default_model`, a mode-specific `model`, or `TINYFLAGS_DEFAULT_MODEL`.
+
+Model aliases live in `models.toml`, not in `config.toml`. When a config file is loaded, repo-style `models.toml` discovery starts from that config path; when `--config` points at a missing file it starts from the explicit config path; otherwise it starts from the command anchor. This repository ships a repo-root [config.toml](/Users/ysera/tinyflags/config.toml) and [models.toml](/Users/ysera/tinyflags/models.toml) so local runs resolve aliases like `fast`, `smart`, and `ops` without relying on harness-built-in model defaults.
+
+Environment support uses the inherited OS process environment only. `tinyflags` does not auto-load a `.env` file.
 
 See:
 

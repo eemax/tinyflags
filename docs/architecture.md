@@ -17,7 +17,7 @@ The implementation is intentionally explicit:
 High-level flow for `tinyflags [flags] "prompt"`:
 
 1. `cmd/tinyflags/main.go` constructs the CLI app and delegates to `internal/cli`.
-2. `internal/cli` parses args and global flags, reads stdin when present, resolves the working directory, and loads config.
+2. `internal/cli` parses args and global flags, reads stdin when present, resolves the working directory, and loads config plus the merged alias catalog from discovered `models.toml` files. When a config file is loaded, alias discovery anchors to that config path; when `--config` is set to a missing file it anchors to the explicit config path; otherwise it anchors to the command working directory.
 3. `internal/mode` converts config plus runtime overrides into an immutable `ResolvedMode`.
 4. `internal/skill` resolves optional skill content from project-local, global, or inline config sources.
 5. `internal/schema` loads JSON schema bytes when `--output-schema` is set.
@@ -51,7 +51,7 @@ Core packages:
 - `internal/cli`
   Cobra command tree, runtime request construction, top-level error rendering, doctor/config/session/mode/skill commands.
 - `internal/config`
-  Defaults, config file parsing, explicit env-var merge, path expansion.
+  Built-in defaults for non-model settings, repo-aware config discovery, `models.toml` discovery/merge, explicit env-var merge, and path expansion.
 - `internal/mode`
   Resolves immutable `ResolvedMode` values.
 - `internal/skill`

@@ -22,7 +22,7 @@ type Config struct {
 	MaxToolRetries      int               `toml:"max_tool_retries"`
 	LogLevel            string            `toml:"log_level"`
 	PlanModeInstruction string            `toml:"plan_mode_instruction"`
-	Models              map[string]string `toml:"models"`
+	Models              map[string]string `toml:"-"`
 	Modes               map[string]ModeConfig
 	Skills              map[string]string `toml:"skills"`
 }

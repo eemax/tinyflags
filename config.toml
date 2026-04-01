@@ -1,0 +1,12 @@
+version = 1
+default_mode = "commander"
+default_model = "ops"
+
+[modes.text]
+model = "fast"
+
+[modes.tool]
+model = "smart"
+
+[modes.commander]
+model = "ops"
