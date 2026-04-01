@@ -1,0 +1,17 @@
+/tinyflags
+.DS_Store
+
+# Database files
+*.db
+*.sqlite
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Go test/build artifacts
+*.test
+*.out
+cover.out
