@@ -17,7 +17,7 @@ The implementation is intentionally explicit:
 High-level flow for `tinyflags [flags] "prompt"`:
 
 1. `cmd/tinyflags/main.go` constructs the CLI app and delegates to `internal/cli`.
-2. `internal/cli` parses args and global flags, reads stdin when present, resolves the working directory, and loads config plus the merged alias catalog from discovered `models.toml` files. When a config file is loaded, alias discovery anchors to that config path; when `--config` is set to a missing file it anchors to the explicit config path; otherwise it anchors to the command working directory.
+2. `internal/cli` parses args and global flags, reads stdin when present up to 10 MB, resolves the working directory, and loads config plus the merged alias catalog from discovered `models.toml` files. Inputs larger than 10 MB fail before provider execution. When a config file is loaded, alias discovery anchors to that config path; when `--config` is set to a missing file it anchors to the explicit config path; otherwise it anchors to the command working directory.
 3. `internal/mode` converts config plus runtime overrides into an immutable `ResolvedMode`.
 4. `internal/skill` resolves optional skill content from project-local, global, or inline config sources.
 5. `internal/schema` loads JSON schema bytes when `--output-schema` is set.
@@ -148,7 +148,7 @@ Important persistence behaviors:
 - run logging hooks are installed only when `ResolvedMode.StoreRunLog` is true
 - final run status is written after schema validation and session persistence so the `runs` table reflects the real CLI outcome
 - run rows persist both the requested model (`model_name`) and actual provider result metadata such as `response_model`, response id, finish reasons, and per-step provider metadata JSON
-- shell-command rows honor `capture_commands`, `capture_stdout`, and `capture_stderr`
+- shell-command rows and persisted session tool messages honor `capture_commands`, `capture_stdout`, and `capture_stderr`
 - hook persistence failures are treated as run failures instead of being silently ignored
 - database schema state is versioned through SQLite `PRAGMA user_version`
 

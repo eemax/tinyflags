@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -26,8 +25,6 @@ type RunLogger interface {
 	LogShellCommand(cmd core.ShellCommandRecord) error
 }
 
-const schemaVersion = 2
-
 func OpenDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, cerr.Wrap(cerr.ExitSessionFailure, "create database directory", err)
@@ -40,49 +37,16 @@ func OpenDB(path string) (*sql.DB, error) {
 	if _, err := db.Exec(`PRAGMA foreign_keys = ON;`); err != nil {
 		return nil, cerr.Wrap(cerr.ExitSessionFailure, "enable foreign keys", err)
 	}
-	if err := migrate(db); err != nil {
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
+		return nil, cerr.Wrap(cerr.ExitSessionFailure, "enable WAL mode", err)
+	}
+	if err := ensureSchema(db); err != nil {
 		return nil, err
 	}
 	return db, nil
 }
 
-func migrate(db *sql.DB) error {
-	var version int
-	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil {
-		return cerr.Wrap(cerr.ExitSessionFailure, "read database schema version", err)
-	}
-	if version > schemaVersion {
-		return cerr.New(cerr.ExitSessionFailure, fmt.Sprintf("database schema version %d is newer than this build supports", version))
-	}
-	if version == schemaVersion {
-		return nil
-	}
-
-	if version == 0 {
-		return createLatestSchema(db)
-	}
-	if version == 1 {
-		stmts := []string{
-			`ALTER TABLE runs ADD COLUMN response_model TEXT;`,
-			`ALTER TABLE runs ADD COLUMN provider_response_id TEXT;`,
-			`ALTER TABLE runs ADD COLUMN finish_reason TEXT;`,
-			`ALTER TABLE runs ADD COLUMN native_finish_reason TEXT;`,
-			`ALTER TABLE runs ADD COLUMN provider_metadata_json TEXT;`,
-		}
-		for _, stmt := range stmts {
-			if _, err := db.Exec(stmt); err != nil {
-				return cerr.Wrap(cerr.ExitSessionFailure, "migrate database", err)
-			}
-		}
-		if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d;`, schemaVersion)); err != nil {
-			return cerr.Wrap(cerr.ExitSessionFailure, "set database schema version", err)
-		}
-		return nil
-	}
-	return nil
-}
-
-func createLatestSchema(db *sql.DB) error {
+func ensureSchema(db *sql.DB) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS sessions (
 			id INTEGER PRIMARY KEY,
@@ -156,9 +120,6 @@ func createLatestSchema(db *sql.DB) error {
 		if _, err := db.Exec(stmt); err != nil {
 			return cerr.Wrap(cerr.ExitSessionFailure, "migrate database", err)
 		}
-	}
-	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d;`, schemaVersion)); err != nil {
-		return cerr.Wrap(cerr.ExitSessionFailure, "set database schema version", err)
 	}
 	return nil
 }
@@ -336,7 +297,12 @@ func (t *RunTracker) Hooks() agent.AgentHooks {
 			t.state.mu.Lock()
 			defer t.state.mu.Unlock()
 			now := t.cfg.Now().UTC()
-			payload, _ := json.Marshal(result)
+			redacted := core.ToolResultCapture{
+				CaptureCommands: t.cfg.CaptureCommands,
+				CaptureStdout:   t.cfg.CaptureStdout,
+				CaptureStderr:   t.cfg.CaptureStderr,
+			}.RedactToolResult(result)
+			payload, _ := json.Marshal(redacted)
 			callID := t.state.toolCallIDs[result.ToolCallID]
 			startedAt := t.state.toolCallTimes[result.ToolCallID]
 			if startedAt.IsZero() {

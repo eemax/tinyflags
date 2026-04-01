@@ -280,3 +280,77 @@ func TestCheckConnectivityUsesModelsEndpoint(t *testing.T) {
 		t.Fatal("expected server to be called")
 	}
 }
+
+func TestCompleteRetriesOnTransientHTTPErrors(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		attempts++
+		if attempts <= 2 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{"message": "rate limited", "code": 429},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":    "gen-retry",
+			"model": "openai/gpt-4.1",
+			"choices": []any{
+				map[string]any{
+					"message":       map[string]any{"content": "retried ok"},
+					"finish_reason": "stop",
+				},
+			},
+			"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
+		})
+	}))
+	defer server.Close()
+
+	client := openrouter.New(server.URL, "secret", server.Client())
+	resp, err := client.Complete(context.Background(), core.CompletionRequest{
+		Model:    "openai/gpt-4.1",
+		Messages: []core.Message{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("Complete returned error: %v", err)
+	}
+	if resp.AssistantMessage.Content != "retried ok" {
+		t.Fatalf("content = %q", resp.AssistantMessage.Content)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestCompleteGivesUpAfterMaxRetries(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		attempts++
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{"message": "service unavailable", "code": 503},
+		})
+	}))
+	defer server.Close()
+
+	client := openrouter.New(server.URL, "secret", server.Client())
+	_, err := client.Complete(context.Background(), core.CompletionRequest{
+		Model:    "openai/gpt-4.1",
+		Messages: []core.Message{{Role: "user", Content: "hello"}},
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	// 1 initial + 3 retries = 4 total attempts
+	if attempts != 4 {
+		t.Fatalf("attempts = %d, want 4", attempts)
+	}
+}

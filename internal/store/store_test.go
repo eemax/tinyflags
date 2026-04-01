@@ -26,13 +26,6 @@ func TestOpenDBBootstrapsSchema(t *testing.T) {
 			t.Fatalf("expected table %q: %v", table, err)
 		}
 	}
-	var version int
-	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil {
-		t.Fatal(err)
-	}
-	if version != 2 {
-		t.Fatalf("user_version = %d, want 2", version)
-	}
 }
 
 func TestHooksPersistRunToolAndShellRecords(t *testing.T) {
@@ -285,67 +278,6 @@ func TestDebugRunsReturnsStoredRuns(t *testing.T) {
 	}
 	if len(runs) != 1 || runs[0].Prompt != "hello" {
 		t.Fatalf("runs = %+v", runs)
-	}
-}
-
-func TestOpenDBMigratesV1RunsTableInPlace(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "tinyflags.db")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`CREATE TABLE runs (
-		id INTEGER PRIMARY KEY,
-		session_id INTEGER,
-		mode_name TEXT NOT NULL,
-		model_name TEXT NOT NULL,
-		prompt TEXT NOT NULL,
-		stdin_text TEXT,
-		system_text TEXT,
-		skill_name TEXT,
-		cwd TEXT,
-		format TEXT NOT NULL,
-		plan_only INTEGER NOT NULL,
-		status TEXT NOT NULL,
-		exit_code INTEGER NOT NULL,
-		started_at TEXT NOT NULL,
-		finished_at TEXT,
-		duration_ms INTEGER,
-		input_tokens INTEGER,
-		output_tokens INTEGER
-	);`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`PRAGMA user_version = 1;`); err != nil {
-		t.Fatal(err)
-	}
-	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := db.Exec(`INSERT INTO runs (id, mode_name, model_name, prompt, format, plan_only, status, exit_code, started_at) VALUES (1, 'text', 'openai/gpt-4o-mini', 'hello', 'text', 0, 'running', 0, ?)`, startedAt); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	migrated, err := store.OpenDB(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer migrated.Close()
-
-	var version int
-	if err := migrated.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil {
-		t.Fatal(err)
-	}
-	if version != 2 {
-		t.Fatalf("user_version = %d, want 2", version)
-	}
-	var prompt string
-	if err := migrated.QueryRow(`SELECT prompt FROM runs WHERE id = 1`).Scan(&prompt); err != nil {
-		t.Fatal(err)
-	}
-	if prompt != "hello" {
-		t.Fatalf("prompt = %q", prompt)
 	}
 }
 

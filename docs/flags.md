@@ -43,6 +43,7 @@ Notes:
 - When the effective run format resolves to `json` through flags, mode settings, or config defaults, failures are emitted as JSON error envelopes on `stdout`.
 - By default, stderr is quiet except for failures. `--verbose` promotes the run log level to `info`, and `--debug` promotes it to `debug`.
 - When `--config` is not set, config discovery checks `~/.tinyflags/config.toml`, then the nearest repo `config.toml` walking up from the command anchor, then falls back to built-in defaults for non-model settings.
+- When stdin is piped, up to 10 MB is accepted as an extra user message; larger inputs fail with exit code `1`.
 
 ## Run Flags
 
@@ -297,9 +298,9 @@ Each mode currently supports:
 | `tools` | `[]string` | Allowed tool names |
 | `persist_session` | bool | Whether session-backed runs persist messages |
 | `store_run_log` | bool | Whether run, tool-call, and shell-command rows are stored in SQLite |
-| `capture_commands` | bool | Whether shell command strings appear in persisted shell-command rows and final JSON command summaries |
-| `capture_stdout` | bool | Whether shell stdout is stored in persisted shell-command rows |
-| `capture_stderr` | bool | Whether shell stderr is stored in persisted shell-command rows |
+| `capture_commands` | bool | Whether shell command strings appear in persisted shell-command rows, persisted session tool messages, and final JSON command summaries |
+| `capture_stdout` | bool | Whether shell stdout is stored in persisted shell-command rows and persisted session tool messages |
+| `capture_stderr` | bool | Whether shell stderr is stored in persisted shell-command rows and persisted session tool messages |
 | `max_steps` | int | Loop step cap |
 | `max_tool_retries` | int | Consecutive tool failure budget |
 | `timeout` | duration | Mode-specific timeout override |

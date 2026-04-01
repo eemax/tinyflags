@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,7 +36,11 @@ type ModelInfo struct {
 const (
 	generationMetadataTimeout = 100 * time.Millisecond
 	generationMetadataSlack   = 50 * time.Millisecond
+	maxResponseBytes          = 32 << 20 // 32 MB
+	maxRetries                = 3
 )
+
+var retryBackoffs = [maxRetries]time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
 
 func New(baseURL, apiKey string, httpClient *http.Client) *Client {
 	return &Client{
@@ -176,27 +181,12 @@ func (c *Client) Complete(ctx context.Context, req core.CompletionRequest) (core
 		return core.CompletionResponse{}, cerr.Wrap(cerr.ExitRuntime, "marshal provider request", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(payload))
+	raw, statusCode, err := c.doWithRetry(requestCtx, ctx, payload)
 	if err != nil {
-		return core.CompletionResponse{}, cerr.Wrap(cerr.ExitRuntime, "create provider request", err)
+		return core.CompletionResponse{}, err
 	}
-	setCommonHeaders(httpReq, c.apiKey)
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		if requestCtx.Err() == context.DeadlineExceeded || ctx.Err() == context.DeadlineExceeded {
-			return core.CompletionResponse{}, cerr.New(cerr.ExitTimeout, "provider request timed out")
-		}
-		return core.CompletionResponse{}, cerr.Wrap(cerr.ExitRuntime, "provider request failed", err)
-	}
-	defer resp.Body.Close()
-
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return core.CompletionResponse{}, cerr.Wrap(cerr.ExitRuntime, "read provider response", err)
-	}
-	if resp.StatusCode >= 400 {
-		return core.CompletionResponse{}, wrapProviderHTTPError(resp.StatusCode, raw)
+	if statusCode >= 400 {
+		return core.CompletionResponse{}, wrapProviderHTTPError(statusCode, raw)
 	}
 
 	var decoded chatResponse
@@ -253,6 +243,63 @@ func (c *Client) Complete(ctx context.Context, req core.CompletionRequest) (core
 	}, nil
 }
 
+func (c *Client) doWithRetry(requestCtx, parentCtx context.Context, payload []byte) ([]byte, int, error) {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(payload))
+		if err != nil {
+			return nil, 0, cerr.Wrap(cerr.ExitRuntime, "create provider request", err)
+		}
+		setCommonHeaders(httpReq, c.apiKey)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			if requestCtx.Err() == context.DeadlineExceeded || parentCtx.Err() == context.DeadlineExceeded {
+				return nil, 0, cerr.New(cerr.ExitTimeout, "provider request timed out")
+			}
+			return nil, 0, cerr.Wrap(cerr.ExitRuntime, "provider request failed", err)
+		}
+
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, 0, cerr.Wrap(cerr.ExitRuntime, "read provider response", readErr)
+		}
+
+		if !retryableStatus(resp.StatusCode) || attempt >= maxRetries {
+			return raw, resp.StatusCode, nil
+		}
+
+		lastErr = fmt.Errorf("provider returned HTTP %d", resp.StatusCode)
+		_ = lastErr
+
+		backoff := retryBackoffs[attempt]
+		if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+			if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds > 0 {
+				parsed := time.Duration(seconds) * time.Second
+				if parsed > backoff {
+					backoff = parsed
+				}
+			}
+		}
+		if deadline, ok := requestCtx.Deadline(); ok && time.Until(deadline) < backoff {
+			return raw, resp.StatusCode, nil
+		}
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-requestCtx.Done():
+			timer.Stop()
+			return nil, 0, cerr.New(cerr.ExitTimeout, "provider request timed out")
+		case <-timer.C:
+		}
+	}
+}
+
+func retryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
+}
+
 func (c *Client) FetchModelCatalog(ctx context.Context) (*ModelCatalog, error) {
 	return FetchModelCatalog(ctx, c.baseURL, c.apiKey, c.httpClient)
 }
@@ -271,7 +318,7 @@ func FetchModelCatalog(ctx context.Context, baseURL, apiKey string, httpClient *
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return nil, err
 	}

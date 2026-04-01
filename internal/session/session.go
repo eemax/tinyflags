@@ -35,18 +35,15 @@ func NewSQLiteStore(db *sql.DB) *SQLiteStore {
 }
 
 func (s *SQLiteStore) LoadOrCreate(name string) (core.Session, error) {
-	if session, err := s.lookup(name); err == nil {
-		return session, nil
-	} else if !isNotFound(err) {
-		return core.Session{}, err
-	}
 	now := time.Now().UTC()
-	result, err := s.db.Exec(`INSERT INTO sessions (name, created_at, updated_at) VALUES (?, ?, ?)`, name, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO sessions (name, created_at, updated_at) VALUES (?, ?, ?)`,
+		name, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano),
+	)
 	if err != nil {
 		return core.Session{}, cerr.Wrap(cerr.ExitSessionFailure, "create session", err)
 	}
-	id, _ := result.LastInsertId()
-	return core.Session{ID: id, Name: name, CreatedAt: now, UpdatedAt: now}, nil
+	return s.lookup(name)
 }
 
 func (s *SQLiteStore) Fork(sourceName, forkName string) (core.Session, error) {
@@ -165,7 +162,10 @@ func (s *SQLiteStore) GetMessages(sessionID int64) ([]core.Message, error) {
 		}
 		out = append(out, msg)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, cerr.Wrap(cerr.ExitSessionFailure, "iterate session messages", err)
+	}
+	return out, nil
 }
 
 func (s *SQLiteStore) List() ([]core.Session, error) {
@@ -185,7 +185,10 @@ func (s *SQLiteStore) List() ([]core.Session, error) {
 		item.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
 		out = append(out, item)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, cerr.Wrap(cerr.ExitSessionFailure, "iterate sessions", err)
+	}
+	return out, nil
 }
 
 func (s *SQLiteStore) Show(name string) (core.Session, []core.StoredMessage, error) {
@@ -221,7 +224,10 @@ func (s *SQLiteStore) Show(name string) (core.Session, []core.StoredMessage, err
 		}
 		out = append(out, item)
 	}
-	return session, out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return core.Session{}, nil, cerr.Wrap(cerr.ExitSessionFailure, "iterate session messages", err)
+	}
+	return session, out, nil
 }
 
 func (s *SQLiteStore) Delete(name string) error {

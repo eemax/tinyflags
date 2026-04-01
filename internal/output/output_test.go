@@ -21,6 +21,18 @@ func TestTextRendererWritesPlainText(t *testing.T) {
 	}
 }
 
+func TestTextRendererPreservesExistingTrailingNewline(t *testing.T) {
+	var buf bytes.Buffer
+	renderer := output.NewTextRenderer(&buf)
+
+	if err := renderer.Render(core.AgentResult{Result: "hello\n"}); err != nil {
+		t.Fatalf("Render returned error: %v", err)
+	}
+	if got := buf.String(); got != "hello\n" {
+		t.Fatalf("output = %q, want %q", got, "hello\n")
+	}
+}
+
 func TestTextRendererPrefersStructuredJSON(t *testing.T) {
 	var buf bytes.Buffer
 	renderer := output.NewTextRenderer(&buf)

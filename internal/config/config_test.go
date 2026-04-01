@@ -273,6 +273,39 @@ func TestLoadFromAnchorUsesExplicitConfigPathForModelDiscovery(t *testing.T) {
 	}
 }
 
+func TestExpandPathHandlesTildeForms(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{"empty", "", "", false},
+		{"tilde only", "~", home, false},
+		{"tilde slash", "~/foo", filepath.Join(home, "foo"), false},
+		{"absolute", "/usr/bin", "/usr/bin", false},
+		{"relative", "rel/path", "rel/path", false},
+		{"tilde username passthrough", "~other/foo", "~other/foo", false},
+		{"spaces only", "   ", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := config.ExpandPath(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ExpandPath(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("ExpandPath(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoadFromAnchorRejectsModelEntriesWithoutID(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

@@ -65,7 +65,7 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 		}
 	}
 
-	systemText := joinText(input.Mode.SystemPrompt, input.SkillText, input.Request.SystemInline)
+	systemText := core.JoinNonEmpty("\n\n", input.Mode.SystemPrompt, input.SkillText, input.Request.SystemInline)
 	messages := make([]core.Message, 0, len(input.SessionMessages)+4)
 	if systemText != "" {
 		messages = append(messages, core.Message{Role: "system", Content: systemText})
@@ -276,17 +276,6 @@ func schemaInstruction(schemaBytes []byte) string {
 	return "Return valid JSON only. Do not wrap it in markdown or add explanatory text."
 }
 
-func joinText(parts ...string) string {
-	filtered := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			filtered = append(filtered, part)
-		}
-	}
-	return strings.Join(filtered, "\n\n")
-}
-
 func toolAllowed(allowed []string, name string) bool {
 	for _, item := range allowed {
 		if item == name {
@@ -339,12 +328,6 @@ func executeToolCall(ctx context.Context, tool tools.Tool, call core.ToolCallReq
 		}, execErr
 	}
 	return tool.Execute(ctx, call, execCtx)
-}
-
-func (r *Runner) emitError(ctx context.Context, err error) {
-	if r.Hooks.OnError != nil {
-		_ = r.Hooks.OnError(ctx, err)
-	}
 }
 
 func (r *Runner) joinWithHookError(ctx context.Context, err error) error {

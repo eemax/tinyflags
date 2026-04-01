@@ -163,17 +163,21 @@ func ExpandPath(path string) (string, error) {
 	if path == "" {
 		return "", nil
 	}
-	if !strings.HasPrefix(path, "~") {
-		return path, nil
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
 	if path == "~" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
 		return home, nil
 	}
-	return filepath.Join(home, strings.TrimPrefix(path, "~/")), nil
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, path[2:]), nil
+	}
+	return path, nil
 }
 
 func applyEnv(cfg *core.Config, lookup func(string) (string, bool)) error {

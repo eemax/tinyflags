@@ -19,6 +19,7 @@ import (
 	"github.com/eemax/tinyflags/internal/provider/openrouter"
 	"github.com/eemax/tinyflags/internal/session"
 	"github.com/eemax/tinyflags/internal/store"
+	"github.com/eemax/tinyflags/internal/tools"
 )
 
 type scriptedProvider struct {
@@ -49,6 +50,36 @@ type failingWriter struct {
 func (w *failingWriter) Write(p []byte) (int, error) {
 	_ = p
 	return 0, w.err
+}
+
+type scriptedTool struct {
+	name   string
+	result core.ToolResult
+	err    error
+}
+
+func (t *scriptedTool) Name() string {
+	return t.name
+}
+
+func (t *scriptedTool) Spec() core.ToolSpec {
+	return core.ToolSpec{
+		Name:        t.name,
+		Description: "test tool",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+	}
+}
+
+func (t *scriptedTool) Execute(ctx context.Context, call core.ToolCallRequest, execCtx tools.ExecContext) (core.ToolResult, error) {
+	_, _ = ctx, execCtx
+	result := t.result
+	if result.ToolCallID == "" {
+		result.ToolCallID = call.ID
+	}
+	if result.ToolName == "" {
+		result.ToolName = t.name
+	}
+	return result, t.err
 }
 
 func TestAppRunJSONEnvelope(t *testing.T) {
@@ -191,6 +222,45 @@ func TestAppForkSessionWithoutSessionFailsUsage(t *testing.T) {
 	code := app.Execute([]string{"--config", cfgPath, "--format", "json", "--fork-session", "child", "hello"})
 	if code != 8 {
 		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestAppRunRejectsOversizedStdin(t *testing.T) {
+	const stdinLimitBytes = 10 << 20
+
+	fake := &scriptedProvider{
+		responses: []core.CompletionResponse{{AssistantMessage: core.Message{Role: "assistant", Content: "done"}}},
+	}
+	app, stdout, stderr, cfgPath := newTestApp(t, fake)
+
+	inputPath := filepath.Join(t.TempDir(), "stdin.txt")
+	if err := os.WriteFile(inputPath, bytes.Repeat([]byte{'a'}, stdinLimitBytes+1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(inputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	originalStdin := os.Stdin
+	os.Stdin = file
+	t.Cleanup(func() {
+		os.Stdin = originalStdin
+	})
+
+	code := app.Execute([]string{"--config", cfgPath, "hello"})
+	if code != 1 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("expected empty stdout, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "stdin exceeds 10 MB limit") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if len(fake.requests) != 0 {
+		t.Fatalf("provider should not be called, got requests = %+v", fake.requests)
 	}
 }
 
@@ -1022,6 +1092,87 @@ func TestAppLinksPersistedSessionMessagesToRun(t *testing.T) {
 		if msg.RunID == nil || *msg.RunID == 0 {
 			t.Fatalf("message missing run_id: %+v", msg)
 		}
+	}
+}
+
+func TestAppPersistsRedactedToolMessagesInSessions(t *testing.T) {
+	fake := &scriptedProvider{
+		responses: []core.CompletionResponse{
+			{
+				AssistantMessage: core.Message{Role: "assistant"},
+				ToolCalls: []core.ToolCallRequest{{
+					ID:        "call-1",
+					Name:      "leaky",
+					Arguments: json.RawMessage(`{}`),
+				}},
+			},
+			{AssistantMessage: core.Message{Role: "assistant", Content: "done"}},
+		},
+	}
+	app, stdout, stderr, cfgPath := newTestAppWithExtraConfig(t, fake, "default_mode = \"text\"\n[modes.text]\ntools = [\"leaky\"]\ncapture_commands = false\ncapture_stdout = false\ncapture_stderr = false\n")
+	registry := tools.NewRegistry()
+	if err := registry.Register(&scriptedTool{
+		name: "leaky",
+		result: core.ToolResult{
+			Status:  "ok",
+			Content: "secret-outsecret-err",
+			Command: &core.CommandResult{
+				Command:  "echo secret",
+				CWD:      "/repo",
+				Stdout:   "secret-out",
+				Stderr:   "secret-err",
+				ExitCode: 0,
+				Executed: true,
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	app.ToolRegistry = registry
+
+	code := app.Execute([]string{"--config", cfgPath, "--mode", "text", "--session", "demo", "hello"})
+	if code != 0 {
+		t.Fatalf("exit code = %d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if stdout.String() != "done" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+
+	db, err := store.OpenDB(dbPathFromConfig(t, cfgPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	admin := session.NewSQLiteStore(db)
+	_, messages, err := admin.Show("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var toolMessage *core.StoredMessage
+	for i := range messages {
+		if messages[i].Role == "tool" {
+			toolMessage = &messages[i]
+			break
+		}
+	}
+	if toolMessage == nil {
+		t.Fatalf("expected tool message in session: %+v", messages)
+	}
+
+	var result core.ToolResult
+	if err := json.Unmarshal([]byte(toolMessage.Content), &result); err != nil {
+		t.Fatalf("invalid persisted tool message: %v", err)
+	}
+	if result.Content != "" {
+		t.Fatalf("content = %q, want empty", result.Content)
+	}
+	if result.Command == nil {
+		t.Fatal("expected command result")
+	}
+	if result.Command.Command != "" || result.Command.Stdout != "" || result.Command.Stderr != "" {
+		t.Fatalf("unexpected persisted command payload: %+v", result.Command)
 	}
 }
 

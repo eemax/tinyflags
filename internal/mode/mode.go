@@ -31,8 +31,8 @@ func Resolve(cfg core.Config, req core.RuntimeRequest) (core.ResolvedMode, error
 		return core.ResolvedMode{}, err
 	}
 
-	format := firstNonEmpty(req.Format, modeCfg.Format, cfg.DefaultFormat)
-	if !supportedFormat(format) {
+	format := core.FirstNonEmpty(req.Format, modeCfg.Format, cfg.DefaultFormat)
+	if !core.SupportedFormat(format) {
 		return core.ResolvedMode{}, cerr.New(cerr.ExitRuntime, fmt.Sprintf("unsupported format %q in resolved mode (expected text or json)", format))
 	}
 	maxSteps := cfg.MaxSteps
@@ -81,7 +81,7 @@ func selectModelValue(override, modeModel, defaultModel string) (string, modelVa
 	if override != "" {
 		return override, modelSourceCLIOverride
 	}
-	return firstNonEmpty(modeModel, defaultModel), modelSourceConfigured
+	return core.FirstNonEmpty(modeModel, defaultModel), modelSourceConfigured
 }
 
 func resolveModel(cfg core.Config, name string, source modelValueSource) (string, error) {
@@ -100,17 +100,4 @@ func resolveModel(cfg core.Config, name string, source modelValueSource) (string
 		code = cerr.ExitCLIUsage
 	}
 	return "", cerr.New(code, fmt.Sprintf("unknown model alias %q", value))
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func supportedFormat(format string) bool {
-	return format == "text" || format == "json"
 }
