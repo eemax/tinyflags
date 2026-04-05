@@ -1,4 +1,5 @@
 /tinyflags
+/tinyflags-bench
 .DS_Store
 
 # Database files
